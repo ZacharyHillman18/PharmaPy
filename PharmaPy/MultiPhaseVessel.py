@@ -611,7 +611,7 @@ class MultiPhaseVessel():
 
         if not isinstance(regions, list):
             raise TypeError(
-                "reaction_regions is expected to be a list"
+                "intraphase_processes is expected to be a list"
             )
 
         if not all(
@@ -619,8 +619,8 @@ class MultiPhaseVessel():
             for r in regions
         ):
             raise TypeError(
-                "reaction_regions should all be "
-                "ReactionRegion objects"
+                "regions should all be "
+                "IntraphaseProcess objects"
             )
 
         self._intraphase_processes = regions
