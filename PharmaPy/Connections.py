@@ -307,9 +307,24 @@ class Connection:
         else:
             self.Matter.time_upstream = time_prof[-1]
 
+    @staticmethod
+    def _outlet_mode(uo):
+        """Operating mode of the side of `uo` that discharges.
+
+        The same as oper_mode for a single unit. A ConcurrentVessel receives
+        through one member and discharges through another, which need not
+        share a mode, so it reports each side separately.
+        """
+        return getattr(uo, 'outlet_oper_mode', None) or uo.oper_mode
+
+    @staticmethod
+    def _inlet_mode(uo):
+        """Operating mode of the side of `uo` that receives."""
+        return getattr(uo, 'inlet_oper_mode', None) or uo.oper_mode
+
     def ConvertUnits(self):
-        mode_source = self.source_uo.oper_mode
-        mode_dest = self.destination_uo.oper_mode
+        mode_source = self._outlet_mode(self.source_uo)
+        mode_dest = self._inlet_mode(self.destination_uo)
 
         flow_flag = (mode_source == 'Continuous' and mode_dest != 'Batch')
         btf_flag = self.source_uo.__class__.__name__ == 'BatchToFlowConnector'
@@ -378,15 +393,20 @@ class Connection:
             converted_states = name_analyzer.convertUnits(self.Matter)
             self.Matter.y_inlet = converted_states
 
-    @staticmethod
-    def _is_refactored_unit(uo):
+    # A ConcurrentVessel is not a MultiPhaseVessel subclass, but every unit
+    # it holds is one, and it hands matter to and from them unchanged.
+    REFACTORED_MODULES = ('PharmaPy.MultiPhaseVessel',
+                          'PharmaPy.ConcurrentVessel')
+
+    @classmethod
+    def _is_refactored_unit(cls, uo):
         """Whether a unit operation is built on MultiPhaseVessel.
 
         Checked through the class hierarchy rather than by importing
         MultiPhaseVessel, which imports this module.
         """
-        return any(cls.__module__ == 'PharmaPy.MultiPhaseVessel'
-                   for cls in type(uo).__mro__)
+        return any(klass.__module__ in cls.REFACTORED_MODULES
+                   for klass in type(uo).__mro__)
 
     @staticmethod
     def _is_refactored_matter(matter):
@@ -505,7 +525,7 @@ class Connection:
     def PassPhases(self):
 
         class_destination = self.destination_uo.__class__.__name__
-        mode_dest = self.destination_uo.oper_mode
+        mode_dest = self._inlet_mode(self.destination_uo)
         transfered_matter = copy.deepcopy(self.Matter)
 
         transfered_matter = self._match_stacks(transfered_matter)
@@ -550,7 +570,7 @@ class Connection:
                 # Scoped to refactored destinations on purpose: changing
                 # how an old semibatch unit is fed would move every
                 # existing old-unit flowsheet.
-                if self.source_uo.oper_mode == 'Continuous':
+                if self._outlet_mode(self.source_uo) == 'Continuous':
                     self.destination_uo.Inlet = transfered_matter
 
                     if self.destination_uo.Phases is None:
@@ -566,7 +586,7 @@ class Connection:
 
         elif mode_dest == 'Continuous':  # Continuous
             # Transfering from batch to continuous (how to approach this?)
-            if self.source_uo.oper_mode != 'Continuous':
+            if self._outlet_mode(self.source_uo) != 'Continuous':
                 pass
                 # TODO: big TODO. We need to define how Batch/Semibatch
                 # followed by continuous will be handled. The most practical

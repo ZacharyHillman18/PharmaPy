@@ -334,7 +334,13 @@ class DefaultContinuousVesselVolume(Controller):
             return []
 
         def outlet_flow_sign(time, completed_state, unit):
-            return float(self.requested_outlet_flow(unit))
+            # The feed actually arriving, not the configured inlet stream:
+            # a vessel fed from an upstream trajectory or a coupled unit
+            # would otherwise place this surface using a flow it never sees.
+            resolved_inlets = unit.resolve_current_inlets(
+                time, completed_state)
+
+            return float(self.requested_outlet_flow(unit, resolved_inlets))
 
         return [
             StateEvent(

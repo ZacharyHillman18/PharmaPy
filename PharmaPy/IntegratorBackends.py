@@ -81,6 +81,19 @@ class IntegratorBackend(ABC):
             "DiffeqpyBackend, which handles them through a mass matrix."
         )
 
+    def invalidate(self):
+        """
+        Forget the compiled problem, so the next solve compiles afresh.
+
+        For a unit whose solver-state layout changed after it was first
+        solved. A ConcurrentVessel that stops iterating its recycle streams
+        and solves them as algebraic states instead gains solver states, and
+        a problem compiled for the old layout would be handed vectors of the
+        wrong length.
+        """
+
+        self._compiled = False
+
     def set_linear_solver(self, kind):
         """
         Ask for a class of linear solver by neutral name.

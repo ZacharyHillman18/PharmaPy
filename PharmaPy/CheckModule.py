@@ -16,10 +16,22 @@ root = pathlib.Path(__file__).parent / 'data'
 
 
 def check_modeling_objects(uo, instance_name=None):
+    class_name = uo.__class__.__name__
+
+    # A ConcurrentVessel holds no modeling objects of its own: every unit it
+    # integrates does, so each of those is checked under a qualified name.
+    members = getattr(uo, 'concurrent_members', None)
+
+    if members:
+        prefix = class_name if instance_name is None else instance_name
+
+        for member_name, member in members.items():
+            check_modeling_objects(member, '%s.%s' % (prefix, member_name))
+
+        return
+
     with open(root / 'minimum_modeling_objects.json') as fi:
         checks = json.load(fi)
-
-    class_name = uo.__class__.__name__
 
     if instance_name is None:
         instance_name = '<InstanceName>'

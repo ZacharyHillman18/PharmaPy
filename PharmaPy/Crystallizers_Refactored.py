@@ -122,12 +122,11 @@ class _BaseCrystallizer(MultiPhaseVessel):
     def _post_CrystKinetics_setter(self):
         "Place holder in case future children need special behavior"
         pass
-    def configure_solver(self):
-        # The distribution block makes the system large and sparse, so an
-        # iterative linear solve beats forming the dense Jacobian. Asking the
-        # backend rather than poking at its solver keeps this working for any
-        # backend; one that has no such choice ignores the request.
-        self.integrator.set_linear_solver("krylov")
+    # The distribution block makes the system large and sparse, so an
+    # iterative linear solve beats forming the dense Jacobian. A request in
+    # neutral terms rather than a poke at the solver keeps this working for
+    # any backend; one that has no such choice ignores it.
+    linear_solver_hint = "krylov"
     def _post_set_phases(self):
         super()._post_set_phases()
         # Re-setting Phases after CrystKinetics (which is what SimulationExec

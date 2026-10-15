@@ -794,10 +794,9 @@ class DeliquoringStep(_BaseSolidLiquidSep):
         for key in [key for key in states if key.name == "mole_conc"]:
             states.pop(key)
 
-    def configure_solver(self):
-        # One state per node per species makes this large and sparse, the
-        # same shape of problem the crystallizer's distribution makes.
-        self.integrator.set_linear_solver("krylov")
+    # One state per node per species makes this large and sparse, the same
+    # shape of problem the crystallizer's distribution makes.
+    linear_solver_hint = "krylov"
 
     # ------------------------------------------------------------------
     # Constants

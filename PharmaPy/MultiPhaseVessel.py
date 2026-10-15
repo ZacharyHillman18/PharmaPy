@@ -277,40 +277,51 @@ class MultiPhaseVessel():
         self._inlet_connections = connections
     def _create_default_connections(self,connection_attr, inlet_streams):
 
-        connections = []
+        connections = [
+            self.make_stream_connection(stream) for stream in inlet_streams
+        ]
 
-        for stream in inlet_streams:
+        setattr(self,connection_attr,connections)
 
-            if not isinstance(stream, MixedStream):
-                stream = MixedStream(stream)
+    @staticmethod
+    def make_stream_connection(stream)->StreamConnection:
+        """
+        A connection carrying `stream`, each phase mapped onto the vessel
+        phase of the same family and position.
 
-            mappings = []
+        Separate from _create_default_connections so a single port can be
+        replaced without rebuilding the others: a ConcurrentVessel swaps
+        one inlet of a member for a flowsheet feed while the member's
+        coupled inlets stay in place.
+        """
 
-            counts = {}
+        if not isinstance(stream, MixedStream):
+            stream = MixedStream(stream)
 
-            for phase in stream:
+        mappings = []
 
-                phase_type = (phase.phase_family.lower())
+        counts = {}
 
-                idx = counts.get(phase_type, 0)
-                counts[phase_type] = idx + 1
+        for phase in stream:
 
-                ref = PhaseRef(phase_type, idx)
+            phase_type = (phase.phase_family.lower())
 
-                mappings.append(
-                    PhaseMapping(
-                        source_phaseref=ref,
-                        sink_phaseref=ref
-                    )
-                )
+            idx = counts.get(phase_type, 0)
+            counts[phase_type] = idx + 1
 
-            connections.append(
-                StreamConnection(
-                    stream=stream,
-                    phase_mappings=mappings
+            ref = PhaseRef(phase_type, idx)
+
+            mappings.append(
+                PhaseMapping(
+                    source_phaseref=ref,
+                    sink_phaseref=ref
                 )
             )
-        setattr(self,connection_attr,connections)
+
+        return StreamConnection(
+            stream=stream,
+            phase_mappings=mappings
+        )
 
     @property
     def outlet_connections(self)->list[StreamConnection]:
@@ -501,6 +512,39 @@ class MultiPhaseVessel():
 
         return names
 
+    def _outlet_fields(self):
+        """
+        What a downstream unit is handed, as {name: StateKey read from}.
+
+        Names are the inter-unit vocabulary that NameAnalyzer and
+        resolve_inlets speak; keys say where this vessel holds each value.
+        `outputs` reads them from a finished result and `outlet_values` from
+        the point last evaluated, so a recorded trajectory and a live
+        coupling cannot disagree about what an outlet carries.
+
+        A population is handed over as the solver holds it, a number DENSITY
+        per m3 of slurry, which is the basis old PharmaPy moved between
+        units: MSMPR.material_balances feeds the received
+        u_inputs['Inlet']['distrib'] straight into
+        tau_inv * (input_distrib - distrib). It used to be an absolute count
+        divided by the vessel volume on the way out; that division is now
+        wrong twice over.
+        """
+        fields = {'mole_conc': StateKey('mole_conc', PhaseRef('liquid', 0))}
+
+        for population_name in self._population_state_names():
+            fields[population_name] = StateKey(
+                population_name, PhaseRef('solid', 0))
+
+        fields['temp'] = StateKey('global_temp')
+
+        if self.is_continuous:
+            fields['vol_flow'] = StateKey('outlet_vol_flow')
+        else:
+            fields['vol'] = StateKey('vessel_vol')
+
+        return fields
+
     @property
     def outputs(self):
         """Outlet trajectory as {state name: array}, which Connections
@@ -513,42 +557,90 @@ class MultiPhaseVessel():
 
         out = {}
 
-        conc = getattr(self.result, 'mole_conc_liquid0', None)
-        if conc is not None:
-            out['mole_conc'] = np.asarray(conc)
-
-        for population_name in self._population_state_names():
-            distrib = getattr(self.result,
-                              population_name + '_solid0', None)
-            if distrib is None:
-                continue
-            # The solver state is already a number DENSITY per m3 of
-            # slurry, which is the basis old PharmaPy moved between units:
-            # MSMPR.material_balances feeds the received
-            # u_inputs['Inlet']['distrib'] straight into
-            # tau_inv * (input_distrib - distrib). It used to be an absolute
-            # count and was divided by the vessel volume here; that division
-            # is now wrong twice over.
-            distrib = np.asarray(distrib, dtype=float)
-
-            out[population_name] = distrib
-
-        temp = getattr(self.result, 'global_temp', None)
-        if temp is not None:
-            out['temp'] = np.asarray(temp)
-
         num_t = len(np.asarray(self.result.time))
 
-        if self.is_continuous:
-            flow = getattr(self.result, 'outlet_vol_flow', None)
-            out['vol_flow'] = (np.full(num_t, getattr(self.Outlet, 'vol_flow', 0.0))
-                               if flow is None else np.ravel(np.asarray(flow)))
-        else:
-            vol = getattr(self.result, 'vessel_vol', None)
-            out['vol'] = (np.full(num_t, self.Phases.vol) if vol is None
-                          else np.ravel(np.asarray(vol)))
+        for name, key in self._outlet_fields().items():
+
+            value = getattr(self.result, StateCollection.format_key(key), None)
+
+            if name == 'vol_flow':
+                out[name] = (
+                    np.full(num_t, getattr(self.Outlet, 'vol_flow', 0.0))
+                    if value is None else np.ravel(np.asarray(value)))
+
+            elif name == 'vol':
+                out[name] = (np.full(num_t, self.Phases.vol) if value is None
+                             else np.ravel(np.asarray(value)))
+
+            elif value is not None:
+                out[name] = np.asarray(value, dtype=float)
 
         return out
+
+    def outlet_values(self):
+        """
+        The outlet in the vocabulary of `outputs`, at the point the vessel
+        was last evaluated, as {name: value}.
+
+        This is the live counterpart of `outputs`: a ConcurrentVessel serves
+        it to the units this vessel feeds while they are all integrated as
+        one system. Every value is the one the right-hand side just used,
+        including an outlet flow the positivity limiter throttled.
+        """
+
+        point = getattr(self, '_last_evaluation', None)
+
+        if point is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.outlet_values needs the vessel to have "
+                "been evaluated: call unit_model at the point of interest "
+                "first."
+            )
+
+        out = {}
+
+        for name, key in self._outlet_fields().items():
+
+            value = self._state_value_at(key, point)
+
+            if value is None:
+                continue
+
+            value = np.asarray(value, dtype=float)
+
+            out[name] = float(value) if value.ndim == 0 else value.copy()
+
+        return out
+
+    def _state_value_at(self, key, point):
+        """
+        A solver or output state at an evaluated point, or None.
+
+        Output states are computed the way the replay computes them. Reading
+        them from the completed state instead would be wrong: complete_state
+        fills an output state from the phase BEFORE the phases are updated,
+        so it holds the previous evaluation's value.
+        """
+
+        completed_state = point['completed_state']
+
+        if key in self.solver_state_collection.states:
+            return completed_state[key]
+
+        variable = self.output_state_collection.states.get(key)
+
+        if variable is not None:
+            return variable.compute_value(
+                state_var=variable,
+                time=point['time'],
+                completed_state=completed_state,
+                context=self,
+                resolved_inlets=point['resolved_inlets'],
+                resolved_outlets=point['resolved_outlets'],
+                operating_conditions=point['operating_conditions'],
+            )
+
+        return completed_state.get(key)
 
     
 
@@ -785,6 +877,11 @@ class MultiPhaseVessel():
         self._event_cache_key = None
         self._event_cache_values = None
 
+        # The point unit_model last evaluated (time, completed state, resolved
+        # streams), which outlet_values reads. None until the first call.
+        self._last_evaluation = None
+        self._last_resolved_outlets = None
+
         self._initialize_state_collections()
 
         
@@ -795,6 +892,7 @@ class MultiPhaseVessel():
 
         self.elapsed_time = 0
         self.result = None
+        self._last_evaluation = None
 
         if self._initial_solver_state is not None:
             self.update_phases_from_state(self._initial_solver_state)
@@ -1423,6 +1521,18 @@ class MultiPhaseVessel():
 
         return out
 
+    def invalidate_inlet_cache(self):
+        """
+        Forget the inlet values cached for the current time.
+
+        The cache is keyed on time alone, which is right for a recorded
+        trajectory or a time profile: those depend on nothing else. An inlet
+        coupled live to another vessel also depends on that vessel's state,
+        which changes at a fixed time whenever the integrator perturbs it, so
+        a ConcurrentVessel calls this before every evaluation of the member.
+        """
+        self._inlet_traj_cache = None
+
     def _inlet_values_at(self, source, time):
         """Inlet field values at one time, or None when the feed is static."""
         dynamic = getattr(source, "DynamicInlet", None)
@@ -1707,8 +1817,16 @@ class MultiPhaseVessel():
             **kwargs
         ) # TODO I don't think this gets called, though it may if the user wants to use fast solve and not solve_unit
 
+    # Neutral linear-solver request ("krylov", "dense", "sparse"), or None to
+    # keep the backend's default. Declared rather than applied by calling
+    # self.integrator, so that something solving several vessels as one
+    # system (ConcurrentVessel) can collect every member's request and pass
+    # the right one to the integrator actually doing the work.
+    linear_solver_hint = None
+
     def configure_solver(self):
-        pass
+        if self.linear_solver_hint is not None:
+            self.integrator.set_linear_solver(self.linear_solver_hint)
 
     def create_solver_init_states(self):
         return self.solver_state_collection.pack(
@@ -1762,6 +1880,21 @@ class MultiPhaseVessel():
         resolved_inlets = self.resolve_inlets(completed_state,operating_conditions,inlet_inputs)
 
         return resolved_inlets,operating_conditions
+
+    def resolve_current_inlets(self, time, completed_state)->StreamConditions:
+        """
+        The inlets exactly as the right-hand side resolves them at this point.
+
+        For code that runs outside the resolve cycle, chiefly event
+        functions, which are handed no resolved streams. Reading the inlet
+        connections directly gives the configured template instead, which
+        is wrong whenever the feed follows an upstream trajectory, a live
+        coupling or a controller override.
+        """
+        resolved_inlets, _ = self.get_operating_conditions(
+            time, completed_state)
+
+        return resolved_inlets
 
     def iter_mechanisms(self):
         """
@@ -1957,6 +2090,16 @@ class MultiPhaseVessel():
         # --------------------------------------------
         buffer = self.limit_material_rates(time,completed_state,resolved_inlets,operating_conditions,limiter_dt=limiter_dt)
 
+        # Everything outlet_values needs to report this point. The resolved
+        # outlets are the ones the limiter has already throttled, so a unit
+        # fed from this one receives what actually left.
+        self._last_evaluation = {
+            'time': time,
+            'completed_state': completed_state,
+            'resolved_inlets': resolved_inlets,
+            'resolved_outlets': self._last_resolved_outlets,
+            'operating_conditions': operating_conditions,
+        }
 
         rates = self.sum_material_contributions(buffer.contributions)
 
@@ -2086,6 +2229,9 @@ class MultiPhaseVessel():
                 completed_state,
                 limiter_dt
             )
+
+            # Scaled in place above, so this is the outlet that actually left.
+            self._last_resolved_outlets = resolved_outlets
 
             return buffer
 
@@ -3121,7 +3267,7 @@ class MultiPhaseVessel():
     def num_species(self):
         #backward compatibility
         return self.Phases.num_species
-    def create_pseudo(self):
+    def create_pseudo(self, memo=None):
         """
         Create an independent vessel for replaying an accepted solver
         trajectory.
@@ -3129,13 +3275,27 @@ class MultiPhaseVessel():
         The pseudo vessel contains the model structure, phases, mechanisms,
         connections, and controller, but does not contain the integrator or
         other runtime solver objects.
+
+        `memo` is a deepcopy memo to share with other pseudos. A
+        ConcurrentVessel replays its members together and pre-registers an
+        empty pseudo for each of them here, so a controller that watches
+        another member is copied pointing at that member's pseudo -- which
+        the joint replay keeps at the right state -- instead of at a frozen
+        copy of the real vessel taken at the end of the run.
         """
 
-        pseudo = object.__new__(type(self))
+        if memo is None:
+            memo = {}
 
-        # Make self-references inside copied objects resolve to the pseudo
-        # rather than accidentally retaining a reference to the real vessel.
-        memo = {id(self): pseudo}
+        pseudo = memo.get(id(self))
+
+        if pseudo is None:
+            pseudo = object.__new__(type(self))
+
+            # Make self-references inside copied objects resolve to the
+            # pseudo rather than accidentally retaining a reference to the
+            # real vessel.
+            memo[id(self)] = pseudo
 
         # Objects that are either non-copyable or represent runtime state
         # that should not be carried into replay.
@@ -3145,6 +3305,8 @@ class MultiPhaseVessel():
             "derivatives",
             "elapsed_time",
             "outlet_conditions",
+            "_last_evaluation",
+            "_last_resolved_outlets",
         }
 
         for name, value in self.__dict__.items():
@@ -3159,6 +3321,15 @@ class MultiPhaseVessel():
 
         # The pseudo is not an integratable vessel.
         pseudo.integrator = None
+        pseudo._last_resolved_outlets = None
+
+        # The phase lookup is keyed on id(phase), and those integer keys
+        # survive the copy while the phases themselves are new objects, so
+        # it has to be rebuilt against the pseudo's own phases. A standalone
+        # replay never asked it a question; a joint replay evaluates the
+        # material balances, and a cross-phase mechanism does.
+        if pseudo.phase_states._compiled:
+            pseudo.phase_states.compile(pseudo.Phases)
 
         pseudo.reset()
 
@@ -3200,53 +3371,16 @@ class MultiPhaseVessel():
             # -----------------------------
             # Recover solver state
             # -----------------------------
-            completed_state = {
+            solver_state = {
                 key: value[i]
                 for key, value in solver_history.items()
                 if key != "time"
             }
 
-            # -----------------------------
-            # Reconstruct controller states
-            # -----------------------------
-            completed_state = pseudo.complete_state(
-                completed_state,
-                t,
-            )
+            outputs = pseudo.output_states_at(t, solver_state)
 
-            # -----------------------------
-            # Update vessel phases
-            # -----------------------------
-            pseudo.update_phases_from_state(completed_state)
-
-            # -----------------------------
-            # Reconstruct operating conditions
-            # -----------------------------
-            resolved_inlets, operating_conditions = (pseudo.get_operating_conditions(t,completed_state))
-
-            resolved_outlets = pseudo._resolve_outlets(
-                completed_state,
-                operating_conditions,
-            )
-
-            # -----------------------------
-            # Evaluate output variables
-            # -----------------------------
-            for key, state in (
-                pseudo.output_state_collection.states.items()
-            ):
-
-                output_history[key].append(
-                    state.compute_value(
-                        state_var=state,
-                        time=t,
-                        completed_state=completed_state,
-                        context=pseudo,
-                        resolved_inlets=resolved_inlets,
-                        resolved_outlets=resolved_outlets,
-                        operating_conditions=operating_conditions,
-                    )
-                )
+            for key, value in outputs.items():
+                output_history[key].append(value)
 
         # Convert lists to arrays
         for key in output_history:
@@ -3256,3 +3390,52 @@ class MultiPhaseVessel():
             )
 
         return output_history
+
+    def output_states_at(self, time, solver_state):
+        """
+        Every output state at one accepted point, as {StateKey: value}.
+
+        One step of the replay, kept separate so that a ConcurrentVessel,
+        which replays all of its members together, runs exactly this for
+        each member at each point rather than a copy of it.
+        """
+
+        # -----------------------------
+        # Reconstruct controller states
+        # -----------------------------
+        completed_state = self.complete_state(
+            solver_state,
+            time,
+        )
+
+        # -----------------------------
+        # Update vessel phases
+        # -----------------------------
+        self.update_phases_from_state(completed_state)
+
+        # -----------------------------
+        # Reconstruct operating conditions
+        # -----------------------------
+        resolved_inlets, operating_conditions = (
+            self.get_operating_conditions(time, completed_state))
+
+        resolved_outlets = self._resolve_outlets(
+            completed_state,
+            operating_conditions,
+        )
+
+        # -----------------------------
+        # Evaluate output variables
+        # -----------------------------
+        return {
+            key: state.compute_value(
+                state_var=state,
+                time=time,
+                completed_state=completed_state,
+                context=self,
+                resolved_inlets=resolved_inlets,
+                resolved_outlets=resolved_outlets,
+                operating_conditions=operating_conditions,
+            )
+            for key, state in self.output_state_collection.states.items()
+        }
