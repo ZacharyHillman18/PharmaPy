@@ -149,6 +149,18 @@ class CoupledInlet:
     live
         The source's outlet_values(), valid once the source has been
         evaluated at the current point.
+
+    Whatever the source, every value is served clipped at zero: a stream
+    carries no negative amounts. That matters more here than between
+    sequential units, because the integrator's finite-difference Jacobian
+    perturbs one member's state and the perturbation now reaches the next
+    member within the same evaluation. A trace species perturbed slightly
+    below zero in the source would otherwise arrive as a negative inflow,
+    and the receiving vessel's positivity limiter -- one factor per phase,
+    set by its scarcest species -- would shut that whole phase's outlet over
+    1e-22 kg of a species it barely holds, making the right-hand side jump.
+    The price is round-off-sized: while a source inventory is negative, the
+    source discharges that negative amount and the sink receives none.
     """
 
     def __init__(self, source, fraction=1.0):
@@ -177,14 +189,26 @@ class CoupledInlet:
         if 'vol_flow' in values:
             values['vol_flow'] = values['vol_flow'] * self.fraction
 
-        return values
+        return self.physical(values)
+
+    @staticmethod
+    def physical(values):
+        """The values with anything negative raised to zero."""
+
+        return {
+            name: (np.maximum(value, 0.0) if isinstance(value, np.ndarray)
+                   else max(float(value), 0.0))
+            for name, value in values.items()
+        }
 
     def evaluate_inputs(self, time):
 
         if self.frozen is not None:
             values = self.frozen
         elif self.override is not None:
-            values = self.override
+            # An algebraic tear state may sit below zero between Newton
+            # iterations; what arrives is still a physical stream.
+            values = self.physical(self.override)
         else:
             values = self.live_values()
 
@@ -830,6 +854,15 @@ class ConcurrentVessel:
         members: one large sparse member makes the whole system large and
         sparse.
         """
+
+        # A member's hint describes its own ODE. Algebraic tear states make a
+        # different Newton system, one an unpreconditioned Krylov solve
+        # handles badly: on a crystallizer recycle, IDA with GMRES had
+        # reached t=1.7e-4 s after 72000 right-hand sides, where a dense
+        # solve covered 300 s in 40 s. So those systems are solved densely.
+        if self._tear_slices:
+            self.integrator.set_linear_solver('dense')
+            return
 
         hints = {member.linear_solver_hint
                  for member in self.members.values()} - {None}

@@ -17,6 +17,11 @@ is attributable to the coupling rather than to the unit models:
     Stage 7  crystallizer pairs, whose link carries a size distribution ==
              SimulationExec
     Stage 8  a ConcurrentVessel as one node of a SimulationExec flowsheet
+    Stage 9  cascade control: R02's controller sets the level R01's
+             controller holds
+    Stage 10 a crystallizer recycle, whose tear carries a size
+             distribution: exact recycle, either tear, iterated or
+             algebraic
 
 usage: python ConcurrentTester.py [assimulo|scipy]
 """
@@ -368,23 +373,47 @@ class FeedFromDownstream(ContinuousVesselController):
                         resolved_outlets)
 
 
-def stage6_control_across_units():
-    open_loop = ConcurrentVessel(
-        {'R01': _continuous_reactor(), 'R02': _fed_reactor()},
-        [StreamLink('R01', 'R02')], integrator=make_integrator())
-    open_loop.solve_unit(runtime=3 * TIME_R01, verbose=False)
+def _open_loop_c():
+    """R02's [C] after 3 h with nothing controlled, cached."""
+    if 'c_open' not in _CACHE:
+        open_loop = ConcurrentVessel(
+            {'R01': _continuous_reactor(), 'R02': _fed_reactor()},
+            [StreamLink('R01', 'R02')], integrator=make_integrator())
+        open_loop.solve_unit(runtime=3 * TIME_R01, verbose=False)
 
-    c_open = float(np.asarray(open_loop.R02.result.mole_conc_liquid0)[-1, 2])
-    c_set = 1.1 * c_open
+        _CACHE['c_open'] = float(
+            np.asarray(open_loop.R02.result.mole_conc_liquid0)[-1, 2])
 
+    return _CACHE['c_open']
+
+
+def _feed_controlled_pair(c_set, order=None):
     r2 = _fed_reactor()
     r1 = _new_reactor(NewContReactor, inlet=_new_feed(),
                       controller=FeedFromDownstream(r2, c_set, gain=8.0,
                                                     nominal_flow=FT.FEED_VOLFLOW))
 
     cv = ConcurrentVessel({'R01': r1, 'R02': r2}, [StreamLink('R01', 'R02')],
-                          integrator=make_integrator())
+                          integrator=make_integrator(), order=order)
     cv.solve_unit(time_grid=np.linspace(0, 3 * TIME_R01, 31), verbose=False)
+
+    return cv
+
+
+def _order_gap(cv, other):
+    """How far two solves of one system, evaluated in different orders, end."""
+    return max(
+        rel(np.asarray(cv[name].result.mass_j_liquid0)[-1],
+            np.asarray(other[name].result.mass_j_liquid0)[-1])
+        for name in cv.members)
+
+
+def stage6_control_across_units():
+    c_open = _open_loop_c()
+    c_set = 1.1 * c_open
+
+    cv = _feed_controlled_pair(c_set)
+    r1, r2 = cv.R01, cv.R02
 
     c_closed = float(np.asarray(r2.result.mole_conc_liquid0)[-1, 2])
 
@@ -404,8 +433,164 @@ def stage6_control_across_units():
         raise AssertionError('R01 reports an outlet flow %.3e away from what '
                              'R02 received' % replay)
 
-    return ('R02 [C] %.5f -> %.5f towards %.5f; replay consistent to %.0e'
-            % (c_open, c_closed, c_set, replay))
+    # R01's controller reads R02 while R01 is being evaluated. Evaluating R02
+    # first instead (which makes R01 -> R02 a tear) must not change what it
+    # reads: every member is brought to the evaluated state before any
+    # balance runs, so the measurement is a function of the state alone.
+    reordered = _feed_controlled_pair(c_set, order=['R02', 'R01'])
+
+    if not reordered.tears:
+        raise AssertionError('evaluating R02 first should have torn R01 -> R02')
+
+    order_gap = _order_gap(cv, reordered)
+
+    if order_gap > 1e-6:
+        raise AssertionError('evaluating R02 first moved the controlled '
+                             'result by %.3e' % order_gap)
+
+    return ('R02 [C] %.5f -> %.5f towards %.5f; replay consistent to %.0e; '
+            'evaluation order immaterial (%.0e)'
+            % (c_open, c_closed, c_set, replay, order_gap))
+
+
+# =====================================================================
+# Stage 9 -- cascade control. R02's controller is the outer loop: from
+# R02's [C] it decides what level R01 should hold. R01's controller is the
+# inner loop: an ordinary level controller whose set point is that request.
+#
+# The set point is PULLED: R01's controller asks the master whenever it
+# needs it, and the master answers from R02's current state. Having the
+# master write into R01's controller instead would make the answer depend on
+# which of the two happened to be evaluated last.
+# =====================================================================
+class QualityMaster(ContinuousVesselController):
+    """R02's controller, which is also the outer loop of a cascade."""
+
+    def __init__(self, c_set, base_volume, span=0.3, gain=10.0):
+        super().__init__(temp_func=lambda t: TEMP_INIT)
+
+        self.c_set = c_set
+        self.base_volume = base_volume
+        self.span = span
+        self.gain = gain
+
+        # The vessel this controller runs, assigned once it is built.
+        self.vessel = None
+
+    def level_setpoint(self):
+        """The volume R01 should hold, from R02's [C] now."""
+
+        return self.setpoint_for(self.vessel.Phases.Liquids[0].mole_conc[2])
+
+    def setpoint_for(self, measured):
+        """The outer loop's law; vectorised, so a recorded run can be fed in."""
+
+        error = (self.c_set - np.asarray(measured, dtype=float)) / self.c_set
+
+        # Residence time in R01 turns C on into D, so a shortfall of C asks
+        # for LESS volume upstream. tanh keeps the request within span of the
+        # base volume, smoothly, from the C-free start onwards.
+        return self.base_volume * (1.0 - self.span * np.tanh(self.gain * error))
+
+
+class LevelFollower(ContinuousVesselController):
+    """R01's controller: a level loop whose set point the master owns."""
+
+    def __init__(self, master):
+        self.master = master
+        super().__init__(temp_func=lambda t: TEMP_INIT)
+
+    @property
+    def target_volume(self):
+        return self.master.level_setpoint()
+
+    @target_volume.setter
+    def target_volume(self, value):
+        # Written by DefaultContinuousVesselVolume's constructor and by
+        # observe. The set point is the master's, so neither is kept.
+        pass
+
+
+def _cascade(c_set, order=None):
+    master = QualityMaster(c_set, base_volume=FT.VOL_INIT)
+
+    r2 = _new_reactor(NewContReactor, controller=master)
+    master.vessel = r2
+
+    r1 = _new_reactor(NewContReactor, inlet=_new_feed(),
+                      controller=LevelFollower(master))
+
+    cv = ConcurrentVessel({'R01': r1, 'R02': r2}, [StreamLink('R01', 'R02')],
+                          integrator=make_integrator(), order=order)
+    cv.solve_unit(time_grid=np.linspace(0, 3 * TIME_R01, 31), verbose=False)
+
+    return cv
+
+
+def stage9_cascade_control():
+    c_open = _open_loop_c()
+    c_set = 1.02 * c_open
+
+    cv = _cascade(c_set)
+    r1, r2 = cv.R01, cv.R02
+    master = r2.controller
+
+    # What the outer loop asked for at every reported time, rebuilt from
+    # R02's recorded [C] with the master's own law, against what R01 held.
+    requested = master.setpoint_for(
+        np.asarray(r2.result.mole_conc_liquid0)[:, 2])
+    held = np.ravel(r1.result.vessel_vol)
+
+    excursion = float(np.max(np.abs(requested - FT.VOL_INIT)))
+
+    if excursion < 0.01 * FT.VOL_INIT:
+        raise AssertionError('the outer loop never moved R01 set point '
+                             '(%.2e m3 at most)' % excursion)
+
+    # The inner loop is a proportional level loop with a time constant of
+    # about a minute, so it trails a moving set point. Early on it trails by
+    # far more: when the outer loop raises the set point, R01 can only fill
+    # as fast as it is fed, since its outlet cannot run backwards. Once that
+    # start-up is over it must stay within a small share of how far the set
+    # point travelled.
+    settled = np.asarray(r1.result.time) > 0.25 * np.asarray(r1.result.time)[-1]
+    tracking = float(np.max(np.abs(held - requested)[settled])) / excursion
+
+    if tracking > 0.05:
+        raise AssertionError('the inner loop strays %.1f%% of the set point '
+                             'excursion from what the outer loop asks for'
+                             % (100 * tracking))
+
+    requested = float(requested[-1])
+
+    c_closed = float(np.asarray(r2.result.mole_conc_liquid0)[-1, 2])
+
+    if abs(c_closed - c_set) >= abs(c_open - c_set):
+        raise AssertionError('the cascade did not move R02 towards its set '
+                             'point: open %.5f, closed %.5f, set %.5f'
+                             % (c_open, c_closed, c_set))
+
+    # R01's outlet is the inner loop's output. If the replay had handed the
+    # follower a stale master, it would report a different outlet than R02
+    # received during the run.
+    replay = rel(np.ravel(r1.result.outlet_vol_flow),
+                 cv.result.couplings['R01->R02']['vol_flow'])
+
+    if replay > 1e-10:
+        raise AssertionError('R01 reports an outlet flow %.3e away from what '
+                             'R02 received' % replay)
+
+    reordered = _cascade(c_set, order=['R02', 'R01'])
+    order_gap = _order_gap(cv, reordered)
+
+    if order_gap > 1e-6:
+        raise AssertionError('evaluating R02 first moved the cascade result '
+                             'by %.3e' % order_gap)
+
+    return ('R01 set point %.4f -> %.4f m3, followed within %.1f%% of its '
+            'excursion; R02 [C] %.5f -> %.5f towards %.5f; order immaterial '
+            '(%.0e)' % (FT.VOL_INIT, requested, 100 * tracking, c_open,
+                        c_closed, c_set, order_gap))
 
 
 # =====================================================================
@@ -456,6 +641,118 @@ def stage7_crystallizer_pairs():
                 '%.3e' % (label, liquid, distrib))
 
         notes.append('%s liquid %.1e distrib %.1e' % (label, liquid, distrib))
+
+    return '; '.join(notes)
+
+
+# =====================================================================
+# Stage 10 -- a crystallizer recycle: half of CR02's slurry goes back to
+# CR01, so the tear carries a size distribution as well as a flow, and both
+# members nucleate from a crystal-free start while it circulates.
+# =====================================================================
+CRYST_RECYCLE = 0.5
+CRYST_RUN = TIME_R01 / 3
+
+
+def _cryst_recycle(first='CR01', **kwargs):
+    members = {'CR01': _continuous_cryst(), 'CR02': _continuous_cryst()}
+
+    if first == 'CR02':
+        members = {'CR02': members['CR02'], 'CR01': members['CR01']}
+
+    links = [StreamLink('CR01', 'CR02', inlet=0),
+             StreamLink('CR02', 'CR01', fraction=CRYST_RECYCLE)]
+
+    kwargs.setdefault('integrator', make_integrator())
+
+    cv = ConcurrentVessel(members, links, **kwargs)
+    cv.solve_unit(runtime=CRYST_RUN, verbose=False)
+
+    return cv
+
+
+def _cryst_gap(cv, reference):
+    """Largest relative difference in any member's final liquid or crystals."""
+    gaps = []
+
+    for name in ('CR01', 'CR02'):
+        for field in ('mass_j_liquid0', 'distrib_solid0'):
+            gaps.append(rel(np.asarray(getattr(cv[name].result, field))[-1],
+                            np.asarray(getattr(reference[name].result,
+                                               field))[-1]))
+
+    return max(gaps)
+
+
+CRYST_RECYCLE_TOL = 1e-3
+
+
+def stage10_crystallizer_recycle():
+    cv = _cryst_recycle()
+    cr01, cr02 = cv.CR01, cv.CR02
+
+    carried = cv.result.couplings['CR02->CR01']
+
+    if 'distrib' not in carried:
+        raise AssertionError('the recycle carried no size distribution (%s)'
+                             % sorted(carried))
+
+    # CR01 receives CR02's crystals as CR02 holds them -- a density per m3 of
+    # slurry, which a split does not change -- at the share asked for.
+    held = np.maximum(np.asarray(cr02.result.distrib_solid0), 0.0)
+    distrib_gap = rel(carried['distrib'], held)
+
+    # The flow is compared once nucleation has started up. Before that the
+    # vessel's positivity limiter throttles the outlet (to 0.82 of the
+    # request in a lone crystallizer), and MultiPhaseVessel's replay reports
+    # the request rather than the throttled flow -- a reporting gap of the
+    # vessel, standalone too. The link carries what actually left.
+    started = np.asarray(cv.result.time) > 0.05 * CRYST_RUN
+    flow_gap = rel(carried['vol_flow'][started],
+                   CRYST_RECYCLE
+                   * np.ravel(cr02.result.outlet_vol_flow)[started])
+
+    if max(distrib_gap, flow_gap) > 1e-12:
+        raise AssertionError('the recycle is not CR02 outlet at %.0f%%: '
+                             'distribution %.3e, flow %.3e'
+                             % (100 * CRYST_RECYCLE, distrib_gap, flow_gap))
+
+    if not np.any(carried['distrib'][-1] > 0):
+        raise AssertionError('no crystals were recycled')
+
+    reordered = _cryst_recycle(first='CR02')
+
+    if [link.label for link in reordered.tears] != ['CR01->CR02']:
+        raise AssertionError('expected the loop torn on CR01->CR02, got %s'
+                             % [link.label for link in reordered.tears])
+
+    order_gap = _cryst_gap(reordered, cv)
+
+    if order_gap > CRYST_RECYCLE_TOL:
+        raise AssertionError('tearing the other link moved the crystallizers '
+                             'by %.3e' % order_gap)
+
+    notes = ['recycle exact (%.0e); other tear within %.1e'
+             % (max(distrib_gap, flow_gap), order_gap)]
+
+    if AssimuloDAEBackend is not None:
+        algebraic = _cryst_recycle(tear_mode='algebraic',
+                                   integrator=make_dae_integrator())
+
+        tear_states = sum(1 for di in algebraic.states_di.values()
+                          if di['type'] == 'alg')
+        alg_gap = _cryst_gap(algebraic, cv)
+
+        if alg_gap > CRYST_RECYCLE_TOL:
+            raise AssertionError('algebraic and iterated crystallizer '
+                                 'recycles differ by %.3e' % alg_gap)
+
+        notes.append('algebraic (%d tear fields) within %.1e'
+                     % (tear_states, alg_gap))
+
+    stats = cv.tear_statistics
+    notes.append('%.1f sweeps per evaluation'
+                 % (stats['sweeps'] / stats['evaluations']))
 
     return '; '.join(notes)
 
@@ -546,6 +843,10 @@ STAGES = (
      stage7_crystallizer_pairs),
     ('8 ConcurrentVessel as a flowsheet node          ',
      stage8_flowsheet_node),
+    ('9 cascade: R02 sets the level R01 holds         ',
+     stage9_cascade_control),
+    ('10 crystallizer recycle carrying crystals       ',
+     stage10_crystallizer_recycle),
 )
 
 
