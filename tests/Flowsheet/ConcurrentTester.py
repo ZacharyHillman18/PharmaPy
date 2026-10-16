@@ -702,15 +702,12 @@ def stage10_crystallizer_recycle():
     held = np.maximum(np.asarray(cr02.result.distrib_solid0), 0.0)
     distrib_gap = rel(carried['distrib'], held)
 
-    # The flow is compared once nucleation has started up. Before that the
-    # vessel's positivity limiter throttles the outlet (to 0.82 of the
-    # request in a lone crystallizer), and MultiPhaseVessel's replay reports
-    # the request rather than the throttled flow -- a reporting gap of the
-    # vessel, standalone too. The link carries what actually left.
-    started = np.asarray(cv.result.time) > 0.05 * CRYST_RUN
-    flow_gap = rel(carried['vol_flow'][started],
-                   CRYST_RECYCLE
-                   * np.ravel(cr02.result.outlet_vol_flow)[started])
+    # Over the whole run, start-up included: while nucleation starts the
+    # vessel's positivity limiter throttles the outlet, and CR02's reported
+    # flow must be the throttled one the link carried, not the level
+    # controller's request (tests/test_outlet_flow_reporting.py).
+    flow_gap = rel(carried['vol_flow'],
+                   CRYST_RECYCLE * np.ravel(cr02.result.outlet_vol_flow))
 
     if max(distrib_gap, flow_gap) > 1e-12:
         raise AssertionError('the recycle is not CR02 outlet at %.0f%%: '

@@ -3198,7 +3198,8 @@ class MultiPhaseVessel():
         # already assumes. Passing the whole array made the controller and
         # the inlet trajectory return arrays where scalars belong.
         resolved_inlets,operating_conditions = self.get_operating_conditions(time[-1],completed_state)
-        resolved_outlets = self._resolve_outlets(completed_state,operating_conditions)
+        resolved_outlets = self.discharged_outlets(
+            time[-1], completed_state, resolved_inlets, operating_conditions)
 
         # The resolved streams live in a workspace that later evaluations
         # overwrite, so the reported final condition takes its own copy.
@@ -3391,6 +3392,31 @@ class MultiPhaseVessel():
 
         return output_history
 
+    def discharged_outlets(self, time, completed_state, resolved_inlets,
+                           operating_conditions):
+        """
+        The outlets as the right-hand side discharged them at this point.
+
+        Resolving the outlets is not enough: unit_model then lets the
+        positivity limiter throttle them, and what leaves is the throttled
+        flow. The replay and the final conditions used to stop at the
+        resolution, so they reported the controller's request instead -- up
+        to 21% above what a continuous crystallizer actually discharged during
+        its nucleation start-up -- and Connections handed that request to the
+        next unit as its feed. This runs the same steps unit_model does, so
+        the two cannot disagree.
+        """
+
+        self.limit_material_rates(
+            time,
+            completed_state,
+            resolved_inlets,
+            operating_conditions,
+            limiter_dt=self.positivity_horizon,
+        )
+
+        return self._last_resolved_outlets
+
     def output_states_at(self, time, solver_state):
         """
         Every output state at one accepted point, as {StateKey: value}.
@@ -3419,8 +3445,10 @@ class MultiPhaseVessel():
         resolved_inlets, operating_conditions = (
             self.get_operating_conditions(time, completed_state))
 
-        resolved_outlets = self._resolve_outlets(
+        resolved_outlets = self.discharged_outlets(
+            time,
             completed_state,
+            resolved_inlets,
             operating_conditions,
         )
 
