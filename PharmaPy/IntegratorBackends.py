@@ -1438,12 +1438,21 @@ class ScipyBackend(IntegratorBackend):
                         "expensive per unit of time."
                     )
 
-            return np.array(
-                unit.unit_model(time=time, states=states),
-                dtype=float,
-            )
+            return self.evaluate_rhs(unit, time, states)
 
         return rhs
+
+    def evaluate_rhs(self, unit, time, states):
+        """One right-hand side evaluation, as a fresh float array.
+
+        The unit's own model here. JaxBackend replaces it with the compiled
+        one and keeps everything around it.
+        """
+
+        return np.array(
+            unit.unit_model(time=time, states=states),
+            dtype=float,
+        )
 
     def make_events(self, unit):
         """Wrap each of the unit's StateEvents for solve_ivp."""
@@ -1896,3 +1905,19 @@ class ScipyBackend(IntegratorBackend):
             out["linear_solver_hint"] = self.linear_solver
 
         return out
+
+
+# The JAX- and CasADi-based backends live in TracedBackends, so that importing
+# this module never imports either library. They are reachable from here too.
+_TRACED_BACKENDS = ("JaxBackend", "JaxAssimuloBackend", "CasadiBackend",
+                    "TracedModel")
+
+
+def __getattr__(name):
+
+    if name in _TRACED_BACKENDS:
+        from PharmaPy import TracedBackends
+
+        return getattr(TracedBackends, name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

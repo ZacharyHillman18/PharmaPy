@@ -3,7 +3,7 @@
 
 
 
-import numpy as np
+from PharmaPy import xp as np
 import json
 import re
 
@@ -43,9 +43,28 @@ def cryst_mechanism(sup_sat, moms, temp, temp_ref, params, reformulate, kv,
 
         elif moms.ndim == 2:
             mom= np.maximum(0, moms[:, order]) # for matrix
-        kinetic_term *= (mom * kv)**s_2
+
+        if np.is_traced(mom):
+            kinetic_term = kinetic_term * _power_from_zero(mom * kv, s_2)
+        else:
+            kinetic_term *= (mom * kv)**s_2
 
     return kinetic_term
+
+
+def _power_from_zero(base, exponent):
+    """base**exponent for base >= 0, with a finite derivative at zero.
+
+    The same value as the power. Its derivative at zero is infinite for an
+    exponent below one -- secondary nucleation's magma term is
+    (kv*mu_3)**s_2 with s_2 = 1e-5, and every batch starts with mu_3 = 0 --
+    and an exact Jacobian holding inf stops the integrator. Taken from the
+    zero side here, the derivative there is 0.
+    """
+    positive = base > 0
+
+    return np.where(positive, np.where(positive, base, 1.0) ** exponent,
+                    0.0 ** exponent)
 
 def disect_rxns(rxns, sep='-->'):
 
@@ -641,17 +660,13 @@ class RxnKinetics:
                 total_rates = np.dot(rrates, self.normalized_stoich.T)
                 short = conc + total_rates * limiter_dt < -eps * 10
 
-                if short.any():
-
-                    # Positive where short: those species are net consumed.
-                    consumed = -total_rates[short] * limiter_dt
-
-                    scale = min(
-                        1.0,
-                        float(np.min(conc[short] / consumed)),
-                    )
-
-                    rrates = rrates * max(scale, 0.0)
+                # The ratio for every species, +inf where it is not short,
+                # so the shape does not depend on the values and a trace can
+                # follow it. The scale is the one the short species alone
+                # give, and exactly 1.0 when nothing is short.
+                consumed = -total_rates * limiter_dt
+                ratio = np.where(short, conc / np.where(short, consumed, 1.0), np.inf)
+                rrates = rrates * np.clip(np.min(ratio), 0.0, 1.0)
 
             total_rates = np.dot(rrates, self.normalized_stoich.T)
             if return_both:
@@ -936,7 +951,11 @@ class CrystKinetics:
             args_sec = (kv_cry, self.reformulate_kin)
             par_sec = par_s
 
-        if isinstance(sup_sat, float):
+        if np.is_traced((sup_sat, moments, temp)):
+            mechs = self._mechanisms_traced(sup_sat, conc_sat, moments, temp,
+                                            kv_cry)
+
+        elif isinstance(sup_sat, float):
             # print(sup_sat)
             args = [sup_sat, conc_sat, moments, temp, self.temp_ref]
             if sup_sat >= 0:
@@ -1031,6 +1050,49 @@ class CrystKinetics:
         else:
             nucl = mechs['nucl_prim'] + mechs['nucl_sec']
             return nucl, mechs['growth'], mechs['dissolution']
+
+    def _mechanisms_traced(self, sup_sat, conc_sat, moments, temp, kv_cry):
+        """The regime switch in get_kinetics, for a traced supersaturation.
+
+        A trace cannot ask which side of zero the supersaturation is on, so
+        both regimes are evaluated and where selects between them, exactly as
+        the scalar branch does: nucleation and growth from zero up,
+        dissolution below. Each regime sees its own side of zero and a clamp
+        at zero on the other, so the branch that is discarded stays finite
+        -- custom mechanisms included -- and cannot put a NaN into the
+        derivative through where.
+        """
+        growing = sup_sat >= 0
+        sides = {
+            True: np.where(growing, sup_sat, 0.0),     # nucleation, growth
+            False: np.where(growing, 0.0, sup_sat),    # dissolution
+        }
+
+        mechs = {}
+
+        for name in self.names_mechanisms:
+            in_growth = name != 'dissolution'
+            sup = sides[in_growth]
+
+            if name in self.custom_mechanisms:
+                value = self.custom_mechanisms[name](
+                    sup, conc_sat, moments, temp, self.temp_ref,
+                    self.params[name])
+            else:
+                value = cryst_mechanism(sup, moments, temp, self.temp_ref,
+                                        self.params[name],
+                                        self.reformulate_kin, kv_cry,
+                                        self.mu_sec_nucl)
+
+            mechs[name] = (np.where(growing, value, 0.0) if in_growth
+                           else np.where(growing, 0.0, value))
+
+        self.prim_nucl = mechs['nucl_prim']
+        self.sec_nucl = mechs['nucl_sec']
+        self.growth = mechs['growth']  # um/s
+        self.dissol = mechs['dissolution']  # um/s
+
+        return mechs
 
     def deriv_cryst(self, conc_tg, conc, temp):
         conc_sat = self.get_solubility(temp, conc)

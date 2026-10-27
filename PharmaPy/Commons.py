@@ -8,7 +8,7 @@ Created on Mon Apr 27 14:22:20 2020
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 # from autograd import numpy as np
-import numpy as np
+from PharmaPy import xp as np
 from scipy.integrate import simpson
 from itertools import cycle
 

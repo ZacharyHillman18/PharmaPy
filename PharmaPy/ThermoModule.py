@@ -6,7 +6,7 @@ Created on Sun Apr  5 17:28:24 2020
 """
 
 import json
-import numpy as np
+from PharmaPy import xp as np
 import pandas as pd
 import pathlib
 
@@ -155,7 +155,7 @@ class ThermoPhysicalManager:
 
         cpMole = np.zeros((num_temp, num_sp))
         for ind, val in enumerate(temp):
-            cpMole[ind] = np.dot(cp_cts, val**ind_poly)  # J/mol_j
+            cpMole = np.set_at(cpMole, ind, np.dot(cp_cts, val**ind_poly))  # J/mol_j
 
         cpMass = cpMole / self.mw * 1000  # J/kg/K
 
@@ -270,7 +270,7 @@ class ThermoPhysicalManager:
         integral = np.zeros((n_temp, n_species))
         for ind, val in enumerate(temp):
             temp_term = val**exp - temp_ref**exp
-            integral[ind] = np.dot(cp_cts / exp, temp_term)  # J/mol_j
+            integral = np.set_at(integral, ind, np.dot(cp_cts / exp, temp_term))  # J/mol_j
 
         delta_cp = np.dot(integral, stoich_matrix.T)
         heat_of_rxn = heat_rxn_ref + delta_cp
@@ -422,13 +422,15 @@ class ThermoPhysicalManager:
             _, densMole = self.getDensityPure(phase='liquid')
             molVol = 1 / densMole  # mol/L, kmol/m3
 
-            mask_solv = np.ones_like(conc, dtype=bool)
+            # Built from the shape alone: the mask does not depend on the
+            # values, and a traced conc would make ones_like immutable.
+            mask_solv = np.ones(np.shape(conc), dtype=bool)
             mask_solv[solvent_ind] = False
 
             conc_solv = (1 - np.dot(conc[mask_solv], molVol[mask_solv])) / \
                 molVol[solvent_ind]
 
-            conc[solvent_ind] = conc_solv
+            conc = np.set_at(conc, solvent_ind, conc_solv)
 
         if conc.ndim == 1:
             mole_frac = conc / conc.sum()
@@ -471,14 +473,16 @@ class ThermoPhysicalManager:
 
         if solvent_ind is not None:
             dens_mass, _ = self.getDensityPure(phase='liquid')
-            mask_solv = np.ones_like(conc, dtype=bool)
+            # Built from the shape alone: the mask does not depend on the
+            # values, and a traced conc would make ones_like immutable.
+            mask_solv = np.ones(np.shape(conc), dtype=bool)
             mask_solv[solvent_ind] = False
 
             conc_solv = (
                 1 - np.dot(conc[mask_solv], 1/dens_mass[mask_solv])) * \
                 dens_mass[solvent_ind]
 
-            conc[solvent_ind] = conc_solv
+            conc = np.set_at(conc, solvent_ind, conc_solv)
 
         if conc.ndim == 1:
             mass_frac = conc / conc.sum()

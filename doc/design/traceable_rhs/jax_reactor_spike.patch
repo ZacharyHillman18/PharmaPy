@@ -1,0 +1,626 @@
+﻿diff --git a/PharmaPy/Commons.py b/PharmaPy/Commons.py
+index 4f0faba..9e55652 100644
+--- a/PharmaPy/Commons.py
++++ b/PharmaPy/Commons.py
+@@ -8,7 +8,7 @@ Created on Mon Apr 27 14:22:20 2020
+ import matplotlib.pyplot as plt
+ from matplotlib.ticker import AutoMinorLocator
+ # from autograd import numpy as np
+-import numpy as np
++from PharmaPy import xp as np
+ from scipy.integrate import simpson
+ from itertools import cycle
+ 
+diff --git a/PharmaPy/DataClasses.py b/PharmaPy/DataClasses.py
+index 6d53ae1..47ef4e9 100644
+--- a/PharmaPy/DataClasses.py
++++ b/PharmaPy/DataClasses.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ import copy
+ import string
+-import numpy as np
++from PharmaPy import xp as np
+ import os
+ from dataclasses import dataclass, field
+ from typing import Optional, Sequence, Any, ClassVar
+@@ -96,7 +96,12 @@ class MaterialContributionBuffer:
+         self.aux = [[], [], [], []]
+ 
+     def reset(self):
+-        self.contributions.fill(0.0)
++        # SPIKE [persistent buffer]: a traced evaluation leaves a jax array
++        # here; the next numeric one needs its numpy buffer back.
++        if isinstance(self.contributions, np.ndarray):
++            self.contributions.fill(0.0)
++        else:
++            self.contributions = np.zeros((4, self.n_values), dtype=float)
+         self.rates.fill(0.0)
+ 
+         for aux in self.aux:
+diff --git a/PharmaPy/Kinetics.py b/PharmaPy/Kinetics.py
+index 162a02f..652e12c 100644
+--- a/PharmaPy/Kinetics.py
++++ b/PharmaPy/Kinetics.py
+@@ -3,7 +3,7 @@
+ 
+ 
+ 
+-import numpy as np
++from PharmaPy import xp as np
+ import json
+ import re
+ 
+@@ -641,17 +641,13 @@ class RxnKinetics:
+                 total_rates = np.dot(rrates, self.normalized_stoich.T)
+                 short = conc + total_rates * limiter_dt < -eps * 10
+ 
+-                if short.any():
+-
+-                    # Positive where short: those species are net consumed.
+-                    consumed = -total_rates[short] * limiter_dt
+-
+-                    scale = min(
+-                        1.0,
+-                        float(np.min(conc[short] / consumed)),
+-                    )
+-
+-                    rrates = rrates * max(scale, 0.0)
++                # SPIKE [value-dependent mask -> fixed shape]: the ratio for
++                # every species, +inf where it is not short, so the shape
++                # does not depend on the values. Same scale as before; 1.0
++                # (an exact no-op) when nothing is short.
++                consumed = -total_rates * limiter_dt
++                ratio = np.where(short, conc / np.where(short, consumed, 1.0), np.inf)
++                rrates = rrates * np.clip(np.min(ratio), 0.0, 1.0)
+ 
+             total_rates = np.dot(rrates, self.normalized_stoich.T)
+             if return_both:
+diff --git a/PharmaPy/Mechanisms.py b/PharmaPy/Mechanisms.py
+index 40c7eef..aa642d6 100644
+--- a/PharmaPy/Mechanisms.py
++++ b/PharmaPy/Mechanisms.py
+@@ -1,5 +1,5 @@
+ import warnings
+-import numpy as np
++from PharmaPy import xp as np
+ import copy
+ from PharmaPy.Distributions import (mass_fraction_to_number,
+                                     to_extensive, to_intensive,
+@@ -380,7 +380,8 @@ class ReactionMechanism(Mechanism):
+         )
+ 
+         species_massPerVol_rates = np.zeros(phase.num_species)
+-        species_massPerVol_rates[mask] = species_rates
++        # SPIKE [in-place write -> set_at]
++        species_massPerVol_rates = np.set_at(species_massPerVol_rates, mask, species_rates)
+         species_massPerVol_rates *= phase.mw
+         species_mass_rates = species_massPerVol_rates* phase.vol   # kmol/(m3 s) * kg/kmol * m3 = kg/s
+         state_rates = {StateKey('mass_j',process.phaseref):species_mass_rates}
+diff --git a/PharmaPy/MixedPhases_Refactored.py b/PharmaPy/MixedPhases_Refactored.py
+index 4c55256..9b246c6 100644
+--- a/PharmaPy/MixedPhases_Refactored.py
++++ b/PharmaPy/MixedPhases_Refactored.py
+@@ -9,7 +9,7 @@ old unit operations still import; nothing here depends on them.
+ 
+ from PharmaPy.Phases_Refactored import BasePhase
+ from collections import defaultdict
+-import numpy as np
++from PharmaPy import xp as np
+ import copy
+ 
+ class MixedPhase:
+@@ -120,10 +120,10 @@ class MixedPhase:
+         masses = np.array([phase.mass for phase in phases], dtype=float) 
+ 
+         total_mass = masses.sum()
+-        if total_mass > 0:
+-            weights = masses / total_mass
+-        else:
+-            weights = np.ones(len(phases), dtype=float) / len(phases)
++        # SPIKE [branch -> where]
++        positive = total_mass > 0
++        weights = np.where(positive, masses / np.where(positive, total_mass, 1.0),
++                           np.ones(len(phases), dtype=float) / len(phases))
+ 
+         attrs = [getattr(phase, name, None) for phase in phases]
+ 
+diff --git a/PharmaPy/MultiPhaseVessel.py b/PharmaPy/MultiPhaseVessel.py
+index 5205918..7d9c4fd 100644
+--- a/PharmaPy/MultiPhaseVessel.py
++++ b/PharmaPy/MultiPhaseVessel.py
+@@ -16,7 +16,7 @@ from PharmaPy.Connections import interpolate_inputs
+ 
+ 
+ import copy
+-import numpy as np
++from PharmaPy import xp as np
+ import os
+ from PharmaPy.DataClasses import *
+ from time import perf_counter
+@@ -1261,19 +1261,19 @@ class MultiPhaseVessel():
+         for key in self.solver_state_collection.keys:
+ 
+             if algebraic_residuals is not None and key in algebraic_residuals:
+-                buffer[solver_slices[key]] = np.asarray(
++                buffer = np.set_at(buffer, solver_slices[key], np.asarray(  # SPIKE [set_at]
+                     algebraic_residuals[key]
+-                ).reshape(-1)
++                ).reshape(-1))
+                 continue
+ 
+             if material_rates is not None and key in material_slices:
+-                buffer[solver_slices[key]] = material_rates[material_slices[key]]
++                buffer = np.set_at(buffer, solver_slices[key], material_rates[material_slices[key]])  # SPIKE [set_at]
+                 continue
+ 
+             if global_rates is not None and key in global_rates:
+-                buffer[solver_slices[key]] = np.asarray(
++                buffer = np.set_at(buffer, solver_slices[key], np.asarray(  # SPIKE [set_at]
+                     global_rates[key]
+-                ).reshape(-1)
++                ).reshape(-1))
+                 continue
+ 
+             # unit_model's diagnostic paths (mat_bce, enrgy_bce) deliberately
+@@ -2111,7 +2111,8 @@ class MultiPhaseVessel():
+         inventory = self._inventory_buffer
+ 
+         for state_key, material_slice in self._positivity_groups:
+-            inventory[material_slice] = completed_state[state_key]
++            # SPIKE [persistent buffer write -> set_at]
++            inventory = np.set_at(inventory, material_slice, completed_state[state_key])
+ 
+         return inventory
+ 
+@@ -2176,28 +2177,20 @@ class MultiPhaseVessel():
+ 
+         active = self._positivity_limited & (demand > 0.0)
+ 
+-        if not active.any():
+-            return None
+-
+-        scales = self._scale_buffer
+-        scales.fill(1.0)
++        # SPIKE [value-dependent mask -> fixed shape]. Numbers keep the
++        # short cut; a trace computes every scale (1 where idle, a no-op).
++        traced = np.is_traced(active)
+ 
+-        scales[active] = self.soft_saturate(
+-            np.maximum(available[active], 0.0) / demand[active]
+-        )
++        if not traced and not active.any():
++            return None
+ 
+-        engaged = False
++        ratio = np.maximum(available, 0.0) / np.where(active, demand, 1.0)
++        scales = np.where(active, self.soft_saturate(ratio), 1.0)
+ 
+         for _, material_slice in self._positivity_groups:
++            scales = np.set_at(scales, material_slice, scales[material_slice].min())
+ 
+-            phase_scale = scales[material_slice].min()
+-
+-            if phase_scale < 1.0:
+-                engaged = True
+-
+-            scales[material_slice] = phase_scale
+-
+-        if not engaged:
++        if not traced and not (scales < 1.0).any():
+             return None
+ 
+         return scales
+@@ -2278,7 +2271,7 @@ class MultiPhaseVessel():
+         factor = 1.0
+ 
+         for material_slice, rate in material_writes:
+-            factor = min(factor, scales[material_slice.start])
++            factor = np.minimum(factor, scales[material_slice.start])  # SPIKE [builtin min]
+ 
+         return factor
+ 
+@@ -2292,8 +2285,6 @@ class MultiPhaseVessel():
+         the source never gave up.
+         """
+ 
+-        row = buffer.contributions[buffer.CROSSPHASE]
+-
+         for aux in buffer.aux[buffer.CROSSPHASE]:
+ 
+             material_writes = aux.get("material_writes")
+@@ -2303,17 +2294,20 @@ class MultiPhaseVessel():
+ 
+             factor = self._transfer_scale(scales, material_writes)
+ 
+-            if factor >= 1.0:
++            # SPIKE [branch on a value]: numbers skip an idle transfer; a
++            # trace scales it by 1, which changes nothing.
++            if not np.is_traced(factor) and factor >= 1.0:
+                 continue
+ 
+             for material_slice, rate in material_writes:
+-                row[material_slice] -= (1.0 - factor) * rate
++                # SPIKE [write through a view -> add_at on the buffer]
++                buffer.contributions = np.add_at(
++                    buffer.contributions, (buffer.CROSSPHASE, material_slice),
++                    -((1.0 - factor) * rate))
+ 
+     def scale_outlet_transfers(self, buffer, scales):
+         """Scale outlet draws, and the streams that report them, together."""
+ 
+-        row = buffer.contributions[buffer.OUTLET]
+-
+         for transfer in buffer.aux[buffer.OUTLET]:
+ 
+             material_slice = self._material_slice_by_phase.get(
+@@ -2325,13 +2319,18 @@ class MultiPhaseVessel():
+ 
+             factor = scales[material_slice.start]
+ 
+-            if factor >= 1.0:
++            if not np.is_traced(factor) and factor >= 1.0:  # SPIKE [branch]
+                 continue
+ 
+-            row[material_slice] += (1.0 - factor) * transfer.species_flow
++            # SPIKE [write through a view -> add_at on the buffer]
++            buffer.contributions = np.add_at(
++                buffer.contributions, (buffer.OUTLET, material_slice),
++                (1.0 - factor) * transfer.species_flow)
+ 
+             for mechanism_slice, rate in transfer.material_writes:
+-                row[mechanism_slice] += (1.0 - factor) * rate
++                buffer.contributions = np.add_at(
++                    buffer.contributions, (buffer.OUTLET, mechanism_slice),
++                    (1.0 - factor) * rate)
+ 
+             transfer.scale(factor, self.basis)
+             transfer.vol_flow *= factor
+@@ -2420,10 +2419,9 @@ class MultiPhaseVessel():
+             self.phase_states.get_phase(m.sink_phaseref).vol
+             for m in connection.phase_mappings)
+ 
+-        if total_vessel_flow <= 0:
+-            return 0.0
+-
+-        fraction = vessel_phase.vol / total_vessel_flow
++        # SPIKE [branch -> where]
++        holding = total_vessel_flow > 0
++        fraction = np.where(holding, vessel_phase.vol / np.where(holding, total_vessel_flow, 1.0), 0.0)
+ 
+         return fraction * total_outlet_flow
+     
+@@ -2445,8 +2443,8 @@ class MultiPhaseVessel():
+         (e.g. settling, phase disengagement, hydraulics).
+         """
+ 
+-        return max(requested_flow, 0.0)
+-    
++        return np.maximum(requested_flow, 0.0)  # SPIKE [builtin max]
++
+     def _resolve_outlets(
+         self,
+         completed_state:dict,
+@@ -2718,10 +2716,8 @@ class MultiPhaseVessel():
+                     state_slice = self.solver_state_collection.material_slices.get(state_key)
+ 
+                     if state_slice is not None:
+-                        buffer.contributions[
+-                            buffer.INLET,
+-                            state_slice,
+-                        ] += value
++                        buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.INLET, state_slice), value)
+     
+     def add_inlet_terms(
+             self,
+@@ -2745,10 +2741,8 @@ class MultiPhaseVessel():
+                     )
+ 
+                     if material_slice is not None:
+-                        buffer.contributions[
+-                            buffer.INLET,
+-                            material_slice,
+-                        ] += transfer.species_flow
++                        buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.INLET, material_slice), transfer.species_flow)
+ 
+                     # A distribution is carried per m3 of SLURRY (that is
+                     # how MultiPhaseVessel.outputs publishes it, matching
+@@ -2773,10 +2767,8 @@ class MultiPhaseVessel():
+                             state_slice = self.solver_state_collection.material_slices.get(state_key)
+ 
+                             if state_slice is not None:
+-                                buffer.contributions[
+-                                    buffer.INLET,
+-                                    state_slice,
+-                                ] += value
++                                buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.INLET, state_slice), value)
+ 
+                     buffer.aux[
+                         buffer.INLET
+@@ -2799,10 +2791,8 @@ class MultiPhaseVessel():
+                     transfer.mapping.sink_phaseref
+                 )
+                 if material_slice is not None:
+-                    buffer.contributions[
+-                        buffer.OUTLET,
+-                        material_slice,
+-                    ] -= transfer.species_flow
++                    buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.OUTLET, material_slice), -(transfer.species_flow))
+ 
+                 for mechanism in transfer.vessel_phase.mechanisms:
+ 
+@@ -2818,10 +2808,8 @@ class MultiPhaseVessel():
+                         state_slice = self.solver_state_collection.material_slices.get(state_key)
+ 
+                         if state_slice is not None:
+-                            buffer.contributions[
+-                                buffer.OUTLET,
+-                                state_slice,
+-                            ] -= value
++                            buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.OUTLET, state_slice), -(value))
+ 
+                             transfer.material_writes.append(
+                                 (state_slice, value)
+@@ -2850,10 +2838,8 @@ class MultiPhaseVessel():
+             for state_key,rate in intraphase_result.state_rates.items():
+                 state_slice = self.solver_state_collection.material_slices.get(state_key)
+                 if state_slice is not None:
+-                    buffer.contributions[
+-                        buffer.INTRAPHASE,
+-                        state_slice,
+-                    ] += rate
++                    buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.INTRAPHASE, state_slice), rate)
+ 
+             buffer.aux[buffer.INTRAPHASE].append(intraphase_result.aux)
+ 
+@@ -2907,10 +2893,8 @@ class MultiPhaseVessel():
+                 material_slice = self.solver_state_collection.material_slices.get(lookup_key)
+ 
+                 if material_slice is not None:
+-                    buffer.contributions[
+-                        buffer.CROSSPHASE,
+-                        material_slice,
+-                    ] += rate
++                    buffer.contributions = np.add_at(  # SPIKE [in-place += -> add_at]
++                buffer.contributions, (buffer.CROSSPHASE, material_slice), rate)
+ 
+                     material_writes.append((material_slice, rate))
+ 
+diff --git a/PharmaPy/Phases_Refactored.py b/PharmaPy/Phases_Refactored.py
+index f550dd4..2a2d81b 100644
+--- a/PharmaPy/Phases_Refactored.py
++++ b/PharmaPy/Phases_Refactored.py
+@@ -1,4 +1,4 @@
+-import numpy as np
++from PharmaPy import xp as np
+ from PharmaPy.ThermoModule import ThermoPhysicalManager
+ from PharmaPy.Commons import trapezoidal_rule
+ from scipy.optimize import newton
+@@ -257,18 +257,16 @@ class BasePhase(ThermoPhysicalManager):
+ 
+         total_mass = value.sum()
+ 
+-        if total_mass > 0:
++        # SPIKE [branch -> where]: keep the last composition at zero mass,
++        # without asking Python whether the mass is zero.
++        if self.mass_frac is None and not np.is_traced(total_mass) and total_mass <= 0:
++            raise RuntimeError("Cannot assign zero mass_j without an existing composition")
+ 
+-            self.mass = total_mass
+-            self.mass_frac = value / total_mass
++        positive = total_mass > 0
++        safe_total = np.where(positive, total_mass, 1.0)
+ 
+-        else:
+-
+-            # Preserve composition information for zero inventory states
+-            self.mass = np.float64(0.0)
+-
+-            if self.mass_frac is None:
+-                raise RuntimeError("Cannot assign zero mass_j without an existing composition")
++        self.mass = np.where(positive, total_mass, 0.0)
++        self.mass_frac = np.where(positive, value / safe_total, self.mass_frac)
+ 
+ 
+     @overridable_property
+@@ -286,7 +284,8 @@ class BasePhase(ThermoPhysicalManager):
+             raise RuntimeError("Cannot set mass before composition is defined")
+ 
+ 
+-        self._mass = np.float64(value)
++        # SPIKE [scalar coercion]: np.float64(tracer) cannot be traced
++        self._mass = np.asarray(value, dtype=float)
+ 
+ 
+ 
+@@ -302,7 +301,8 @@ class BasePhase(ThermoPhysicalManager):
+ 
+         value=np.asarray(value,dtype=float)
+ 
+-        if not np.isclose(value.sum(),1):
++        # SPIKE [validation]: checks run on numbers only
++        if not np.is_traced(value) and not np.isclose(value.sum(),1):
+             raise ValueError(
+                 "mass_frac must sum to one"
+             )
+diff --git a/PharmaPy/ProcessControl_Refactored.py b/PharmaPy/ProcessControl_Refactored.py
+index f894d82..eccc591 100644
+--- a/PharmaPy/ProcessControl_Refactored.py
++++ b/PharmaPy/ProcessControl_Refactored.py
+@@ -2,8 +2,7 @@ from PharmaPy.DataClasses import (PhaseConnection,PhaseMapping,PhaseRef,PhaseSta
+                                   IntraPhaseProcess,StateCollection,StateKey,StateVariable,StreamConnection,
+                                   OperatingKey, StateEvent)
+ from typing import Any
+-import numpy as np
+-
++from PharmaPy import xp as np
+ eps = np.finfo(float).eps
+ 
+ 
+@@ -214,10 +213,10 @@ class DefaultContinuousVesselVolume(Controller):
+ 
+         if tau is None:
+ 
+-            if inlet_flow > 0 and self.target_volume:
+-                residence_time = self.target_volume / inlet_flow
+-            else:
+-                residence_time = 1.0
++            # SPIKE [branch -> where]
++            flowing = (inlet_flow > 0) & (self.target_volume > 0)
++            residence_time = np.where(
++                flowing, self.target_volume / np.where(flowing, inlet_flow, 1.0), 1.0)
+ 
+             tau = 0.01 * residence_time
+ 
+@@ -234,16 +233,13 @@ class DefaultContinuousVesselVolume(Controller):
+         corner there is one the integrator keeps rediscovering.
+         """
+ 
+-        if width <= 0:
+-            return max(value, 0.0)
+-
+-        if value >= width:
+-            return value
+-
+-        if value <= -width:
+-            return 0.0
++        # SPIKE [branch -> where]: the three pieces of the C1 floor
++        safe_width = np.where(width > 0, width, 1.0)
++        bridge = (value + safe_width) ** 2 / (4.0 * safe_width)
++        smooth = np.where(value >= width, value,
++                          np.where(value <= -width, 0.0, bridge))
+ 
+-        return (value + width) ** 2 / (4.0 * width)
++        return np.where(width > 0, smooth, np.maximum(value, 0.0))
+ 
+ 
+     def actuate(
+@@ -272,7 +268,7 @@ class DefaultContinuousVesselVolume(Controller):
+             )
+         ] = self.soft_floor(
+             outlet_flow,
+-            self.floor_width * max(inlet_flow, eps),
++            self.floor_width * np.maximum(inlet_flow, eps),  # SPIKE [builtin max]
+         )
+ 
+     @staticmethod
+diff --git a/PharmaPy/Streams_Refactored.py b/PharmaPy/Streams_Refactored.py
+index 2a97f2d..201322a 100644
+--- a/PharmaPy/Streams_Refactored.py
++++ b/PharmaPy/Streams_Refactored.py
+@@ -5,8 +5,7 @@ from PharmaPy.DataClasses import StateVariable,StateKey
+ import copy
+ 
+ from scipy.interpolate import CubicSpline
+-import numpy as np
+-
++from PharmaPy import xp as np
+ # ===========================
+ # Legacy Streams content
+ # ===========================
+diff --git a/PharmaPy/ThermoModule.py b/PharmaPy/ThermoModule.py
+index 169e3f9..fa655d8 100644
+--- a/PharmaPy/ThermoModule.py
++++ b/PharmaPy/ThermoModule.py
+@@ -6,7 +6,7 @@ Created on Sun Apr  5 17:28:24 2020
+ """
+ 
+ import json
+-import numpy as np
++from PharmaPy import xp as np
+ import pandas as pd
+ import pathlib
+ 
+@@ -155,7 +155,7 @@ class ThermoPhysicalManager:
+ 
+         cpMole = np.zeros((num_temp, num_sp))
+         for ind, val in enumerate(temp):
+-            cpMole[ind] = np.dot(cp_cts, val**ind_poly)  # J/mol_j
++            cpMole = np.set_at(cpMole, ind, np.dot(cp_cts, val**ind_poly))  # J/mol_j  SPIKE [set_at]
+ 
+         cpMass = cpMole / self.mw * 1000  # J/kg/K
+ 
+@@ -270,7 +270,7 @@ class ThermoPhysicalManager:
+         integral = np.zeros((n_temp, n_species))
+         for ind, val in enumerate(temp):
+             temp_term = val**exp - temp_ref**exp
+-            integral[ind] = np.dot(cp_cts / exp, temp_term)  # J/mol_j
++            integral = np.set_at(integral, ind, np.dot(cp_cts / exp, temp_term))  # J/mol_j  SPIKE [set_at]
+ 
+         delta_cp = np.dot(integral, stoich_matrix.T)
+         heat_of_rxn = heat_rxn_ref + delta_cp
+diff --git a/PharmaPy/xp.py b/PharmaPy/xp.py
+new file mode 100644
+index 0000000..6312cc8
+--- /dev/null
++++ b/PharmaPy/xp.py
+@@ -0,0 +1,63 @@
++﻿"""Array namespace for the RHS path: numpy, except that a call with a JAX
++tracer among its arguments goes to jax.numpy.
++
++Imported as `np` by the modules on the right-hand-side path, so numeric
++callers see plain numpy, unchanged, and a traced call is traced.
++"""
++import numpy as _np
++
++try:
++    import jax as _jax
++    import jax.numpy as _jnp
++except ImportError:  # numpy-only installs keep working
++    _jax = _jnp = None
++
++
++def is_traced(obj):
++    if _jax is None:
++        return False
++    if isinstance(obj, _jax.core.Tracer):
++        return True
++    if isinstance(obj, (list, tuple)):
++        return any(is_traced(o) for o in obj)
++    if isinstance(obj, dict):
++        return any(is_traced(o) for o in obj.values())
++    return False
++
++
++def __getattr__(name):
++    attr = getattr(_np, name)
++    if not callable(attr) or isinstance(attr, type) or _jnp is None:
++        return attr
++    jattr = getattr(_jnp, name, None)
++    if jattr is None:
++        return attr
++
++    def dispatch(*args, **kwargs):
++        if is_traced(args) or is_traced(kwargs):
++            return jattr(*args, **kwargs)
++        return attr(*args, **kwargs)
++
++    dispatch.__name__ = name
++    return dispatch
++
++
++def set_at(array, index, value):
++    """array[index] = value, returning the result.
++
++    numpy: writes into `array` in place and returns it, exactly as before.
++    traced: returns a new array (jax arrays are immutable), promoting a
++    numpy buffer that is about to receive a traced value.
++    """
++    if is_traced(array) or is_traced(value):
++        return _jnp.asarray(array).at[index].set(value)
++    array[index] = value
++    return array
++
++
++def add_at(array, index, value):
++    """array[index] += value, returning the result (see set_at)."""
++    if is_traced(array) or is_traced(value):
++        return _jnp.asarray(array).at[index].add(value)
++    array[index] += value
++    return array

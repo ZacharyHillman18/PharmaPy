@@ -2,8 +2,7 @@ from PharmaPy.DataClasses import (PhaseConnection,PhaseMapping,PhaseRef,PhaseSta
                                   IntraPhaseProcess,StateCollection,StateKey,StateVariable,StreamConnection,
                                   OperatingKey, StateEvent)
 from typing import Any
-import numpy as np
-
+from PharmaPy import xp as np
 eps = np.finfo(float).eps
 
 
@@ -138,7 +137,8 @@ class TemperatureProfileMixin:
         super().update_state(time, completed_state, unit)
 
         if self.temp_func is not None:
-            self.states[StateKey("global_temp")] = self.temp_func(time)
+            self.states[StateKey("global_temp")] = np.of_time(self.temp_func,
+                                                              time)
 
 
 class SimpleTemperatureController(TemperatureProfileMixin, Controller):
@@ -214,10 +214,12 @@ class DefaultContinuousVesselVolume(Controller):
 
         if tau is None:
 
-            if inlet_flow > 0 and self.target_volume:
-                residence_time = self.target_volume / inlet_flow
-            else:
-                residence_time = 1.0
+            # 'inlet_flow > 0 and target_volume', as where: an unset or
+            # zero target falls back to one second.
+            target = 0.0 if self.target_volume is None else self.target_volume
+            flowing = (inlet_flow > 0) & (target != 0)
+            residence_time = np.where(
+                flowing, target / np.where(flowing, inlet_flow, 1.0), 1.0)
 
             tau = 0.01 * residence_time
 
@@ -234,16 +236,14 @@ class DefaultContinuousVesselVolume(Controller):
         corner there is one the integrator keeps rediscovering.
         """
 
-        if width <= 0:
-            return max(value, 0.0)
+        # The three pieces of the C1 floor, selected with where so that a
+        # trace sees all of them.
+        safe_width = np.where(width > 0, width, 1.0)
+        bridge = (value + safe_width) ** 2 / (4.0 * safe_width)
+        smooth = np.where(value >= width, value,
+                          np.where(value <= -width, 0.0, bridge))
 
-        if value >= width:
-            return value
-
-        if value <= -width:
-            return 0.0
-
-        return (value + width) ** 2 / (4.0 * width)
+        return np.where(width > 0, smooth, np.maximum(value, 0.0))
 
 
     def actuate(
@@ -272,7 +272,7 @@ class DefaultContinuousVesselVolume(Controller):
             )
         ] = self.soft_floor(
             outlet_flow,
-            self.floor_width * max(inlet_flow, eps),
+            self.floor_width * np.maximum(inlet_flow, eps),
         )
 
     @staticmethod

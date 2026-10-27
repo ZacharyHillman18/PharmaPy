@@ -1,0 +1,187 @@
+﻿diff --git a/PharmaPy/MixedPhases_Refactored.py b/PharmaPy/MixedPhases_Refactored.py
+index 9b246c6..37b9cdd 100644
+--- a/PharmaPy/MixedPhases_Refactored.py
++++ b/PharmaPy/MixedPhases_Refactored.py
+@@ -119,7 +119,7 @@ class MixedPhase:
+         phases = object.__getattribute__(self,"_Phases")
+         masses = np.array([phase.mass for phase in phases], dtype=float) 
+ 
+-        total_mass = masses.sum()
++        total_mass = np.sum(masses)  # SPIKE [method -> function]
+         # SPIKE [branch -> where]
+         positive = total_mass > 0
+         weights = np.where(positive, masses / np.where(positive, total_mass, 1.0),
+diff --git a/PharmaPy/Phases_Refactored.py b/PharmaPy/Phases_Refactored.py
+index 2a2d81b..9fa4320 100644
+--- a/PharmaPy/Phases_Refactored.py
++++ b/PharmaPy/Phases_Refactored.py
+@@ -255,7 +255,7 @@ class BasePhase(ThermoPhysicalManager):
+         if value.shape[0] != self.num_species:
+             raise ValueError("mass_j length does not match number of species")
+ 
+-        total_mass = value.sum()
++        total_mass = np.sum(value)  # SPIKE [method -> function: CasADi SX has no .sum()]
+ 
+         # SPIKE [branch -> where]: keep the last composition at zero mass,
+         # without asking Python whether the mass is zero.
+@@ -307,7 +307,7 @@ class BasePhase(ThermoPhysicalManager):
+                 "mass_frac must sum to one"
+             )
+ 
+-        self._mass_frac=value.copy()
++        self._mass_frac=np.copy(value)  # SPIKE [method -> function]
+ 
+     @overridable_property
+     def mole_frac(self):
+diff --git a/PharmaPy/xp.py b/PharmaPy/xp.py
+index 6312cc8..e5a95fc 100644
+--- a/PharmaPy/xp.py
++++ b/PharmaPy/xp.py
+@@ -1,8 +1,10 @@
+-﻿"""Array namespace for the RHS path: numpy, except that a call with a JAX
+-tracer among its arguments goes to jax.numpy.
++"""Array namespace for the RHS path.
+ 
+-Imported as `np` by the modules on the right-hand-side path, so numeric
+-callers see plain numpy, unchanged, and a traced call is traced.
++Imported as `np` by the modules on the right-hand-side path. A call goes to
++
++    jax.numpy   if any argument is a JAX tracer,
++    _CASADI     (a small adapter table) if any argument is a CasADi symbol,
++    numpy       otherwise -- so numeric callers see plain numpy, unchanged.
+ """
+ import numpy as _np
+ 
+@@ -12,30 +14,83 @@ try:
+ except ImportError:  # numpy-only installs keep working
+     _jax = _jnp = None
+ 
++try:
++    import casadi as _ca
++except ImportError:
++    _ca = None
+ 
+-def is_traced(obj):
+-    if _jax is None:
+-        return False
+-    if isinstance(obj, _jax.core.Tracer):
++
++def _any(obj, test):
++    if test(obj):
+         return True
+     if isinstance(obj, (list, tuple)):
+-        return any(is_traced(o) for o in obj)
++        return any(_any(o, test) for o in obj)
+     if isinstance(obj, dict):
+-        return any(is_traced(o) for o in obj.values())
++        return any(_any(o, test) for o in obj.values())
+     return False
+ 
+ 
++def is_jax(obj):
++    return _jax is not None and _any(obj, lambda o: isinstance(o, _jax.core.Tracer))
++
++
++def is_symbolic(obj):
++    return _ca is not None and _any(obj, lambda o: isinstance(o, (_ca.SX, _ca.MX)))
++
++
++def is_traced(obj):
++    """True for either kind of trace: branch on values only when False."""
++    return is_jax(obj) or is_symbolic(obj)
++
++
++# ---- CasADi adapters: numpy semantics on SX column vectors ---------------
++def _sx(a):
++    return a if is_symbolic(a) else _ca.SX(_np.asarray(a, dtype=float))
++
++
++def _asarray(a, dtype=None, **kw):
++    if isinstance(a, (list, tuple)):
++        return _ca.vertcat(*[_sx(x) for x in a])
++    return a
++
++
++def _dot(a, b):
++    """numpy dot on CasADi values. Every SX column is taken to stand for a
++    numpy 1-D array, which SX itself cannot tell from an (n, 1) matrix."""
++    a2, b2 = _sx(a), _sx(b)
++    a_vec, b_vec = a2.shape[1] == 1, b2.shape[1] == 1
++    if a_vec and b_vec:
++        return _ca.dot(a2, b2)                 # 1-D . 1-D -> scalar
++    if a_vec:
++        return _ca.mtimes(a2.T, b2).T          # 1-D . 2-D -> 1-D
++    return _ca.mtimes(a2, b2)                  # 2-D . anything
++
++_CASADI = {
++    "asarray": _asarray, "array": _asarray, "atleast_1d": lambda a: a,
++    "where": lambda c, a, b: _ca.if_else(c, a, b),
++    "maximum": _ca.fmax, "minimum": _ca.fmin,
++    "clip": lambda a, lo, hi: _ca.fmin(_ca.fmax(a, lo), hi),
++    "exp": _ca.exp, "log": _ca.log, "sqrt": _ca.sqrt, "abs": _ca.fabs,
++    "sum": lambda a, axis=None: _ca.sum1(_sx(a)) if axis in (None, 0) else _ca.sum2(_sx(a)),
++    "min": lambda a, axis=None: _ca.mmin(_sx(a)), "max": lambda a, axis=None: _ca.mmax(_sx(a)),
++    "dot": _dot, "matmul": _dot, "copy": lambda a: _ca.SX(a),
++}
++
++
+ def __getattr__(name):
+     attr = getattr(_np, name)
+-    if not callable(attr) or isinstance(attr, type) or _jnp is None:
+-        return attr
+-    jattr = getattr(_jnp, name, None)
+-    if jattr is None:
++    if not callable(attr) or isinstance(attr, type):
+         return attr
++    jattr = getattr(_jnp, name, None) if _jnp is not None else None
++    cattr = _CASADI.get(name)
+ 
+     def dispatch(*args, **kwargs):
+-        if is_traced(args) or is_traced(kwargs):
++        if jattr is not None and (is_jax(args) or is_jax(kwargs)):
+             return jattr(*args, **kwargs)
++        if is_symbolic(args) or is_symbolic(kwargs):
++            if cattr is None:
++                raise NotImplementedError(f"xp.{name} has no CasADi adapter")
++            return cattr(*args, **kwargs)
+         return attr(*args, **kwargs)
+ 
+     dispatch.__name__ = name
+@@ -46,18 +101,33 @@ def set_at(array, index, value):
+     """array[index] = value, returning the result.
+ 
+     numpy: writes into `array` in place and returns it, exactly as before.
+-    traced: returns a new array (jax arrays are immutable), promoting a
+-    numpy buffer that is about to receive a traced value.
++    jax: a new array (jax arrays are immutable). casadi: an SX copy.
+     """
+-    if is_traced(array) or is_traced(value):
++    if is_jax(array) or is_jax(value):
+         return _jnp.asarray(array).at[index].set(value)
++    if is_symbolic(array) or is_symbolic(value):
++        out = _sx(array)
++        out[_ca_index(index)] = value
++        return out
+     array[index] = value
+     return array
+ 
+ 
+ def add_at(array, index, value):
+     """array[index] += value, returning the result (see set_at)."""
+-    if is_traced(array) or is_traced(value):
++    if is_jax(array) or is_jax(value):
+         return _jnp.asarray(array).at[index].add(value)
++    if is_symbolic(array) or is_symbolic(value):
++        out = _sx(array)
++        idx = _ca_index(index)
++        out[idx] = out[idx] + value
++        return out
+     array[index] += value
+     return array
++
++
++def _ca_index(index):
++    """numpy index -> CasADi index (boolean masks become positions)."""
++    if isinstance(index, _np.ndarray) and index.dtype == bool:
++        return [int(i) for i in _np.flatnonzero(index)]
++    return index

@@ -16,7 +16,7 @@ from PharmaPy.Connections import interpolate_inputs
 
 
 import copy
-import numpy as np
+from PharmaPy import xp as np
 import os
 from PharmaPy.DataClasses import *
 from time import perf_counter
@@ -24,6 +24,21 @@ from time import perf_counter
 
 
 eps = np.finfo(float).eps
+
+
+def _flow_or_zero(value):
+    """``value or 0.0`` for a flow that may be None, traced values included.
+
+    A traced flow has no truth value, so only None is replaced for it.
+    """
+    if value is None:
+        return 0.0
+
+    if np.is_traced(value):
+        return value
+
+    return value or 0.0
+
 
 class MultiPhaseVessel():
 
@@ -608,7 +623,7 @@ class MultiPhaseVessel():
 
             value = np.asarray(value, dtype=float)
 
-            out[name] = float(value) if value.ndim == 0 else value.copy()
+            out[name] = np.as_float(value) if value.ndim == 0 else value.copy()
 
         return out
 
@@ -1261,19 +1276,19 @@ class MultiPhaseVessel():
         for key in self.solver_state_collection.keys:
 
             if algebraic_residuals is not None and key in algebraic_residuals:
-                buffer[solver_slices[key]] = np.asarray(
+                buffer = np.set_at(buffer, solver_slices[key], np.asarray(
                     algebraic_residuals[key]
-                ).reshape(-1)
+                ).reshape(-1))
                 continue
 
             if material_rates is not None and key in material_slices:
-                buffer[solver_slices[key]] = material_rates[material_slices[key]]
+                buffer = np.set_at(buffer, solver_slices[key], material_rates[material_slices[key]])
                 continue
 
             if global_rates is not None and key in global_rates:
-                buffer[solver_slices[key]] = np.asarray(
+                buffer = np.set_at(buffer, solver_slices[key], np.asarray(
                     global_rates[key]
-                ).reshape(-1)
+                ).reshape(-1))
                 continue
 
             # unit_model's diagnostic paths (mat_bce, enrgy_bce) deliberately
@@ -1487,7 +1502,12 @@ class MultiPhaseVessel():
         always yields None. And this runs twice per right-hand side
         evaluation, so the result is cached per time -- interpolate_inputs
         builds a fresh interpolant per key per call.
+
+        Under a trace, see _inlet_trajectories_traced.
         """
+        if np.is_traced(time):
+            return self._inlet_trajectories_traced(time)
+
         cached = self._inlet_traj_cache
 
         if cached is not None and cached[0] == time:
@@ -1520,6 +1540,50 @@ class MultiPhaseVessel():
         self._inlet_traj_cache = (time, out)
 
         return out
+
+    def _inlet_trajectories_traced(self, time):
+        """_evaluate_inlet_trajectories for a traced time.
+
+        A feed that follows time alone -- a recorded upstream trajectory, a
+        DynamicInlet profile -- is interpolated by ordinary Python, which a
+        trace cannot look inside, and needs nothing from the state, so it is
+        run on the number through np.of_time. A feed coupled live to another
+        vessel (a ConcurrentVessel link, whose DynamicInlet says
+        follows_state) depends on that vessel's state, which is part of the
+        trace, so it is evaluated in it. Sending it through of_time would
+        hand back numbers from outside the trace and nothing would say so.
+        """
+        out = None
+
+        for connection_num, connection in enumerate(self.inlet_connections):
+
+            for mapping in connection.phase_mappings:
+
+                inner = connection.stream.get_phase_from_ref(
+                    mapping.source_phaseref)
+
+                values = self._inlet_values_traced(inner, time)
+
+                if values is None:
+                    values = self._inlet_values_traced(connection.stream,
+                                                       time)
+
+                if values is None:
+                    continue
+
+                out = {} if out is None else out
+                out[(connection_num, mapping.source_phaseref)] = values
+
+        return out
+
+    def _inlet_values_traced(self, source, time):
+        dynamic = getattr(source, "DynamicInlet", None)
+
+        if getattr(dynamic, "follows_state", False):
+            return dict(source.evaluate_inputs(time))
+
+        return np.of_time(lambda now: self._inlet_values_at(source, now),
+                          time)
 
     def invalidate_inlet_cache(self):
         """
@@ -2111,7 +2175,7 @@ class MultiPhaseVessel():
         inventory = self._inventory_buffer
 
         for state_key, material_slice in self._positivity_groups:
-            inventory[material_slice] = completed_state[state_key]
+            inventory = np.set_at(inventory, material_slice, completed_state[state_key])
 
         return inventory
 
@@ -2176,28 +2240,20 @@ class MultiPhaseVessel():
 
         active = self._positivity_limited & (demand > 0.0)
 
-        if not active.any():
+        # Numbers keep the short cut. A trace cannot ask whether anything
+        # is throttled, so it computes every scale; 1 where idle is a no-op.
+        traced = np.is_traced(active)
+
+        if not traced and not active.any():
             return None
 
-        scales = self._scale_buffer
-        scales.fill(1.0)
-
-        scales[active] = self.soft_saturate(
-            np.maximum(available[active], 0.0) / demand[active]
-        )
-
-        engaged = False
+        ratio = np.maximum(available, 0.0) / np.where(active, demand, 1.0)
+        scales = np.where(active, self.soft_saturate(ratio), 1.0)
 
         for _, material_slice in self._positivity_groups:
+            scales = np.set_at(scales, material_slice, scales[material_slice].min())
 
-            phase_scale = scales[material_slice].min()
-
-            if phase_scale < 1.0:
-                engaged = True
-
-            scales[material_slice] = phase_scale
-
-        if not engaged:
+        if not traced and not (scales < 1.0).any():
             return None
 
         return scales
@@ -2278,7 +2334,7 @@ class MultiPhaseVessel():
         factor = 1.0
 
         for material_slice, rate in material_writes:
-            factor = min(factor, scales[material_slice.start])
+            factor = np.minimum(factor, scales[material_slice.start])
 
         return factor
 
@@ -2292,8 +2348,6 @@ class MultiPhaseVessel():
         the source never gave up.
         """
 
-        row = buffer.contributions[buffer.CROSSPHASE]
-
         for aux in buffer.aux[buffer.CROSSPHASE]:
 
             material_writes = aux.get("material_writes")
@@ -2303,16 +2357,20 @@ class MultiPhaseVessel():
 
             factor = self._transfer_scale(scales, material_writes)
 
-            if factor >= 1.0:
+            # Numbers skip an idle transfer; a trace scales it by 1, which
+            # changes nothing.
+            if not np.is_traced(factor) and factor >= 1.0:
                 continue
 
             for material_slice, rate in material_writes:
-                row[material_slice] -= (1.0 - factor) * rate
+                # Into the buffer itself: a traced write through a row view
+                # would only change a copy.
+                buffer.contributions = np.add_at(
+                    buffer.contributions, (buffer.CROSSPHASE, material_slice),
+                    -((1.0 - factor) * rate))
 
     def scale_outlet_transfers(self, buffer, scales):
         """Scale outlet draws, and the streams that report them, together."""
-
-        row = buffer.contributions[buffer.OUTLET]
 
         for transfer in buffer.aux[buffer.OUTLET]:
 
@@ -2325,13 +2383,17 @@ class MultiPhaseVessel():
 
             factor = scales[material_slice.start]
 
-            if factor >= 1.0:
+            if not np.is_traced(factor) and factor >= 1.0:
                 continue
 
-            row[material_slice] += (1.0 - factor) * transfer.species_flow
+            buffer.contributions = np.add_at(
+                buffer.contributions, (buffer.OUTLET, material_slice),
+                (1.0 - factor) * transfer.species_flow)
 
             for mechanism_slice, rate in transfer.material_writes:
-                row[mechanism_slice] += (1.0 - factor) * rate
+                buffer.contributions = np.add_at(
+                    buffer.contributions, (buffer.OUTLET, mechanism_slice),
+                    (1.0 - factor) * rate)
 
             transfer.scale(factor, self.basis)
             transfer.vol_flow *= factor
@@ -2420,10 +2482,8 @@ class MultiPhaseVessel():
             self.phase_states.get_phase(m.sink_phaseref).vol
             for m in connection.phase_mappings)
 
-        if total_vessel_flow <= 0:
-            return 0.0
-
-        fraction = vessel_phase.vol / total_vessel_flow
+        holding = total_vessel_flow > 0
+        fraction = np.where(holding, vessel_phase.vol / np.where(holding, total_vessel_flow, 1.0), 0.0)
 
         return fraction * total_outlet_flow
     
@@ -2445,8 +2505,8 @@ class MultiPhaseVessel():
         (e.g. settling, phase disengagement, hydraulics).
         """
 
-        return max(requested_flow, 0.0)
-    
+        return np.maximum(requested_flow, 0.0)
+
     def _resolve_outlets(
         self,
         completed_state:dict,
@@ -2696,15 +2756,15 @@ class MultiPhaseVessel():
         phase's inlet hook. The rate of volume change is taken as the
         difference between the volumetric inflow and outflow.
         """
-        vol_in = sum(transfer.vol_flow or 0.0
+        vol_in = sum(_flow_or_zero(transfer.vol_flow)
                      for connection in resolved_inlets
                      for transfer in connection)
-        vol_out = sum(transfer.vol_flow or 0.0
+        vol_out = sum(_flow_or_zero(transfer.vol_flow)
                       for connection in resolved_outlets
                       for transfer in connection)
         net_vol_flow = vol_in - vol_out
 
-        if not net_vol_flow:
+        if not np.is_traced(net_vol_flow) and not net_vol_flow:
             return
 
         for phase in self.Phases.Phases:
@@ -2718,10 +2778,8 @@ class MultiPhaseVessel():
                     state_slice = self.solver_state_collection.material_slices.get(state_key)
 
                     if state_slice is not None:
-                        buffer.contributions[
-                            buffer.INLET,
-                            state_slice,
-                        ] += value
+                        buffer.contributions = np.add_at(
+                            buffer.contributions, (buffer.INLET, state_slice), value)
     
     def add_inlet_terms(
             self,
@@ -2745,10 +2803,8 @@ class MultiPhaseVessel():
                     )
 
                     if material_slice is not None:
-                        buffer.contributions[
-                            buffer.INLET,
-                            material_slice,
-                        ] += transfer.species_flow
+                        buffer.contributions = np.add_at(
+                            buffer.contributions, (buffer.INLET, material_slice), transfer.species_flow)
 
                     # A distribution is carried per m3 of SLURRY (that is
                     # how MultiPhaseVessel.outputs publishes it, matching
@@ -2757,7 +2813,7 @@ class MultiPhaseVessel():
                     # it. Using the solid's own vol_flow would understate
                     # the crystal feed by the solid volume fraction.
                     slurry_vol_flow = sum(
-                        t.vol_flow or 0.0 for t in resolved_connection)
+                        _flow_or_zero(t.vol_flow) for t in resolved_connection)
 
                     for mechanism in transfer.vessel_phase.mechanisms:
 
@@ -2773,10 +2829,8 @@ class MultiPhaseVessel():
                             state_slice = self.solver_state_collection.material_slices.get(state_key)
 
                             if state_slice is not None:
-                                buffer.contributions[
-                                    buffer.INLET,
-                                    state_slice,
-                                ] += value
+                                buffer.contributions = np.add_at(
+                                    buffer.contributions, (buffer.INLET, state_slice), value)
 
                     buffer.aux[
                         buffer.INLET
@@ -2799,10 +2853,8 @@ class MultiPhaseVessel():
                     transfer.mapping.sink_phaseref
                 )
                 if material_slice is not None:
-                    buffer.contributions[
-                        buffer.OUTLET,
-                        material_slice,
-                    ] -= transfer.species_flow
+                    buffer.contributions = np.add_at(
+                        buffer.contributions, (buffer.OUTLET, material_slice), -(transfer.species_flow))
 
                 for mechanism in transfer.vessel_phase.mechanisms:
 
@@ -2818,10 +2870,8 @@ class MultiPhaseVessel():
                         state_slice = self.solver_state_collection.material_slices.get(state_key)
 
                         if state_slice is not None:
-                            buffer.contributions[
-                                buffer.OUTLET,
-                                state_slice,
-                            ] -= value
+                            buffer.contributions = np.add_at(
+                                buffer.contributions, (buffer.OUTLET, state_slice), -(value))
 
                             transfer.material_writes.append(
                                 (state_slice, value)
@@ -2850,10 +2900,8 @@ class MultiPhaseVessel():
             for state_key,rate in intraphase_result.state_rates.items():
                 state_slice = self.solver_state_collection.material_slices.get(state_key)
                 if state_slice is not None:
-                    buffer.contributions[
-                        buffer.INTRAPHASE,
-                        state_slice,
-                    ] += rate
+                    buffer.contributions = np.add_at(
+                        buffer.contributions, (buffer.INTRAPHASE, state_slice), rate)
 
             buffer.aux[buffer.INTRAPHASE].append(intraphase_result.aux)
 
@@ -2907,10 +2955,8 @@ class MultiPhaseVessel():
                 material_slice = self.solver_state_collection.material_slices.get(lookup_key)
 
                 if material_slice is not None:
-                    buffer.contributions[
-                        buffer.CROSSPHASE,
-                        material_slice,
-                    ] += rate
+                    buffer.contributions = np.add_at(
+                        buffer.contributions, (buffer.CROSSPHASE, material_slice), rate)
 
                     material_writes.append((material_slice, rate))
 

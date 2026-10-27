@@ -1,7 +1,7 @@
 from __future__ import annotations
 import copy
 import string
-import numpy as np
+from PharmaPy import xp as np
 import os
 from dataclasses import dataclass, field
 from typing import Optional, Sequence, Any, ClassVar
@@ -96,7 +96,12 @@ class MaterialContributionBuffer:
         self.aux = [[], [], [], []]
 
     def reset(self):
-        self.contributions.fill(0.0)
+        # A traced evaluation leaves a jax array here; the next numeric one
+        # needs its numpy buffer back.
+        if isinstance(self.contributions, np.ndarray):
+            self.contributions.fill(0.0)
+        else:
+            self.contributions = np.zeros((4, self.n_values), dtype=float)
         self.rates.fill(0.0)
 
         for aux in self.aux:

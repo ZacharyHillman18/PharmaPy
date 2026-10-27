@@ -5,8 +5,7 @@ from PharmaPy.DataClasses import StateVariable,StateKey
 import copy
 
 from scipy.interpolate import CubicSpline
-import numpy as np
-
+from PharmaPy import xp as np
 # ===========================
 # Legacy Streams content
 # ===========================

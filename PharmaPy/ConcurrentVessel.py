@@ -71,8 +71,7 @@ import copy
 import warnings
 from contextlib import contextmanager
 
-import numpy as np
-
+from PharmaPy import xp as np
 from PharmaPy.DataClasses import StateCollection, StateVariable
 from PharmaPy.IntegratorBackends import ScipyBackend
 from PharmaPy.MultiPhaseVessel import MultiPhaseVessel
@@ -163,6 +162,11 @@ class CoupledInlet:
     source discharges that negative amount and the sink receives none.
     """
 
+    # What this inlet serves depends on the source vessel's state, not on
+    # time alone, so a traced right-hand side evaluates it in the trace
+    # (MultiPhaseVessel._inlet_trajectories_traced).
+    follows_state = True
+
     def __init__(self, source, fraction=1.0):
 
         self.source = source
@@ -196,7 +200,8 @@ class CoupledInlet:
         """The values with anything negative raised to zero."""
 
         return {
-            name: (np.maximum(value, 0.0) if isinstance(value, np.ndarray)
+            name: (np.maximum(value, 0.0)
+                   if isinstance(value, np.ndarray) or np.is_traced(value)
                    else max(float(value), 0.0))
             for name, value in values.items()
         }
@@ -906,10 +911,11 @@ class ConcurrentVessel:
         rates = self._rate_buffer
 
         for name in self.order:
-            rates[self._member_slices[name]] = self.members[name].derivatives
+            rates = np.set_at(rates, self._member_slices[name],
+                              self.members[name].derivatives)
 
         for label, block in self._tear_blocks.items():
-            rates[block] = self._tear_residuals[label]
+            rates = np.set_at(rates, block, self._tear_residuals[label])
 
         self.derivatives = rates
 
@@ -950,10 +956,22 @@ class ConcurrentVessel:
         """
 
         states = np.asarray(states, dtype=float)
-        key = (float(time), states.tobytes())
 
-        if key == self._eval_key:
+        # A traced point has no bytes to memoize on, and is evaluated once.
+        traced = np.is_traced((time, states))
+        key = None if traced else (float(time), states.tobytes())
+
+        if not traced and key == self._eval_key:
             return
+
+        if traced and self.tears and not self._tear_slices:
+            raise NotImplementedError(
+                f"Recycle {', '.join(link.label for link in self.tears)} is "
+                "converged by iterating inside the right-hand side, which a "
+                "trace cannot follow: how many sweeps it takes depends on "
+                "the values. Use tear_mode='algebraic', which carries the "
+                "tear streams as algebraic states instead, with a backend "
+                "that solves differential-algebraic systems.")
 
         self._eval_key = None
 
@@ -1154,7 +1172,7 @@ class ConcurrentVessel:
 
         for field, dim in self._tear_layouts[link.label]:
             block = vector[position:position + dim]
-            values[field] = float(block[0]) if dim == 1 else block.copy()
+            values[field] = np.as_float(block[0]) if dim == 1 else block.copy()
             position += dim
 
         return values
@@ -1193,7 +1211,7 @@ class ConcurrentVessel:
 
         for field, dim in self._tear_layouts[link.label]:
             block = states[self._tear_slices[link.label][field]] * scales[field]
-            values[field] = float(block[0]) if dim == 1 else block.copy()
+            values[field] = np.as_float(block[0]) if dim == 1 else block.copy()
 
         return values
 

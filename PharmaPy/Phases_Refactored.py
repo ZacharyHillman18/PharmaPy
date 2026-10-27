@@ -1,4 +1,4 @@
-import numpy as np
+from PharmaPy import xp as np
 from PharmaPy.ThermoModule import ThermoPhysicalManager
 from PharmaPy.Commons import trapezoidal_rule
 from scipy.optimize import newton
@@ -257,18 +257,16 @@ class BasePhase(ThermoPhysicalManager):
 
         total_mass = value.sum()
 
-        if total_mass > 0:
+        # Keep the last composition at zero mass, selected with where so a
+        # trace does not have to ask whether the mass is zero.
+        if self.mass_frac is None and not np.is_traced(total_mass) and total_mass <= 0:
+            raise RuntimeError("Cannot assign zero mass_j without an existing composition")
 
-            self.mass = total_mass
-            self.mass_frac = value / total_mass
+        positive = total_mass > 0
+        safe_total = np.where(positive, total_mass, 1.0)
 
-        else:
-
-            # Preserve composition information for zero inventory states
-            self.mass = np.float64(0.0)
-
-            if self.mass_frac is None:
-                raise RuntimeError("Cannot assign zero mass_j without an existing composition")
+        self.mass = np.where(positive, total_mass, 0.0)
+        self.mass_frac = np.where(positive, value / safe_total, self.mass_frac)
 
 
     @overridable_property
@@ -286,7 +284,8 @@ class BasePhase(ThermoPhysicalManager):
             raise RuntimeError("Cannot set mass before composition is defined")
 
 
-        self._mass = np.float64(value)
+        # np.float64 cannot take a traced value, which is kept as it is
+        self._mass = value if np.is_traced(value) else np.float64(value)
 
 
 
@@ -302,7 +301,8 @@ class BasePhase(ThermoPhysicalManager):
 
         value=np.asarray(value,dtype=float)
 
-        if not np.isclose(value.sum(),1):
+        # Checked on numbers only; a traced value has none to check
+        if not np.is_traced(value) and not np.isclose(value.sum(),1):
             raise ValueError(
                 "mass_frac must sum to one"
             )

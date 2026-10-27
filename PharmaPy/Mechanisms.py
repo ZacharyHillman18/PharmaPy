@@ -1,5 +1,5 @@
 import warnings
-import numpy as np
+from PharmaPy import xp as np
 import copy
 from PharmaPy.Distributions import (mass_fraction_to_number,
                                     to_extensive, to_intensive,
@@ -278,12 +278,33 @@ class MechanismView:
             **kwargs,
         )
 
+        # Each view keeps the result only on its own side of zero, and the
+        # forward (crystallization) view owns zero itself. When both kept it,
+        # a net rate of exactly zero counted the population balance twice:
+        # a moments crystallizer (nucleus size 0) starts with mu_2 = 0, so its
+        # net rate is zero while nucleation is not, and mu_0 grew at twice
+        # the rate there. The original method_of_moments evaluates once.
+        if np.is_traced(result.net_mass_rate):
+            # A trace multiplies by the test rather than dropping the rates,
+            # so the result has the same keys whichever side it is on.
+            if self.direction == "forward":
+                keep = result.net_mass_rate >= 0
+            else:
+                keep = result.net_mass_rate < 0
+
+            return TransferResult(
+                state_rates={key: np.where(keep, rate, 0.0)
+                             for key, rate in result.state_rates.items()},
+                aux=result.aux,
+                net_mass_rate=np.where(keep, result.net_mass_rate, 0.0),
+            )
+
         if self.direction == "forward":
             if result.net_mass_rate < 0:
                 return self.zero_out(result)
 
         else:
-            if result.net_mass_rate > 0:
+            if result.net_mass_rate >= 0:
                 return self.zero_out(result)
 
         return result
@@ -380,7 +401,7 @@ class ReactionMechanism(Mechanism):
         )
 
         species_massPerVol_rates = np.zeros(phase.num_species)
-        species_massPerVol_rates[mask] = species_rates
+        species_massPerVol_rates = np.set_at(species_massPerVol_rates, mask, species_rates)
         species_massPerVol_rates *= phase.mw
         species_mass_rates = species_massPerVol_rates* phase.vol   # kmol/(m3 s) * kg/kmol * m3 = kg/s
         state_rates = {StateKey('mass_j',process.phaseref):species_mass_rates}
@@ -570,8 +591,9 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         moments = np.zeros(4)
 
         for n in range(4):
-            moments[n] = self.integrate_over_size(distrib * x_grid**n,
-                                                  x_grid)
+            moments = np.set_at(moments, n,
+                                self.integrate_over_size(distrib * x_grid**n,
+                                                         x_grid))
 
         return moments * self.MOMENT_UNIT_FACTOR ** np.arange(4)
 
@@ -633,8 +655,10 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
     ):
         "Express the liquid in whatever basis the solubility is stated in."
         conc = self.liquid_in_solubility_basis(liquid)
-        
-        conc_target = conc.T[self.target_ind]
+
+        # An index array rather than the list: same selection, and a traced
+        # array accepts only the array form.
+        conc_target = conc.T[np.asarray(self.target_ind)]
         
         # Supersaturation
         solubility = self.mechanism_kinetics.get_solubility(liquid.temp, conc)
@@ -670,7 +694,8 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         mask = self.target_ind
 
         # Assume equal split unless overridden later.
-        rates[mask] = -crystal_mass_rate/ len(mask)
+        rates = np.set_at(rates, np.asarray(mask),
+                          -crystal_mass_rate / len(mask))
 
         return rates
 
@@ -916,10 +941,19 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         fraction rather than one helper wanting micron-based moments and
         another metre-based ones.
         """
-        phi = min(max(self.solid_volume_fraction(true_state), 0.0),
-                  1.0 - 1e-12)
+        phi = self.solid_volume_fraction(true_state)
 
-        vol_slurry = float(liquid.vol) / (1.0 - phi)
+        # Read once: the liquid's volume is its mass over a mixture density.
+        vol_liquid = liquid.vol
+
+        if np.is_traced((phi, vol_liquid)):
+            # The same clamp and division as below, without asking Python
+            # for the numbers.
+            vol_slurry = vol_liquid / (1.0 - np.clip(phi, 0.0, 1.0 - 1e-12))
+        else:
+            phi = min(max(phi, 0.0), 1.0 - 1e-12)
+            vol_slurry = float(vol_liquid) / (1.0 - phi)
+
         self.slurry_volume = vol_slurry
 
         return vol_slurry
@@ -989,7 +1023,11 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
             try:
                 return self.slurry_volume_from(liquid, true_state)
             except (AttributeError, TypeError, ValueError):
-                pass
+                # A trace that fails here must say so. Falling back to the
+                # cache would quietly freeze the slurry volume into the
+                # compiled right-hand side.
+                if np.is_traced(true_state):
+                    raise
 
         if self.slurry_volume is not None:
             return self.slurry_volume
@@ -1085,7 +1123,7 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
     def get_inlet_contributions(self, stream_phase, vessel_phase, amount,
                                 completed_state):
 
-        if not amount:
+        if not np.is_traced(amount) and not amount:
             return {}
 
         density = self._inlet_population_density(stream_phase)
@@ -1109,18 +1147,45 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         vol_slurry = self._slurry_volume(
             self.true_state(np.asarray(state, dtype=float)))
 
+        if np.is_traced((amount, vol_slurry)):
+            return {key: self._per_volume(amount, vol_slurry) * density}
+
         if vol_slurry <= 0:
             return {}
 
         return {key: (amount / vol_slurry) * density}
 
+    @staticmethod
+    def _per_volume(amount, volume):
+        """amount / volume where anything is held, else 0, for a trace.
+
+        The flow terms below return no rate at all when the amount or the
+        volume is zero. A trace cannot ask, so it computes the rate with a
+        safe divisor and multiplies the empty case down to zero.
+        """
+        holding = volume > 0
+
+        return np.where(holding, amount / np.where(holding, volume, 1.0), 0.0)
+
     def get_outlet_contributions(self, stream_phase, vessel_phase, amount,
                                  completed_state):
+
+        vol = getattr(vessel_phase, 'vol', 0.0)
+
+        if np.is_traced((amount, vol)):
+            key = self._flow_state_key()
+            state = completed_state.get(key)
+
+            if state is None:
+                state = getattr(self, self.flow_state_name)
+
+            return {key: self._per_volume(amount, 0.0 if vol is None else vol)
+                    * np.asarray(state, dtype=float)}
 
         if not amount:
             return {}
 
-        vol = getattr(vessel_phase, 'vol', 0.0) or 0.0
+        vol = vol or 0.0
 
         if vol <= 0:
             # Nothing held, so nothing to withdraw. The population is zero
@@ -1149,7 +1214,7 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         with liquid it is what keeps the growing volume from multiplying the
         crystal mass.
         """
-        if not net_vol_flow:
+        if not np.is_traced(net_vol_flow) and not net_vol_flow:
             return {}
 
         key = self._flow_state_key()
@@ -1160,6 +1225,9 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
 
         state = np.asarray(state, dtype=float)
         vol_slurry = self._slurry_volume(self.true_state(state))
+
+        if np.is_traced((net_vol_flow, vol_slurry)):
+            return {key: -self._per_volume(net_vol_flow, vol_slurry) * state}
 
         if vol_slurry <= 0:
             return {}
@@ -1488,6 +1556,11 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         vol_slurry = self._slurry_volume(
             self.true_state(getattr(self,self.distribution_state_name)))
 
+        if np.is_traced((mass, vol_slurry,
+                         getattr(self, self.distribution_state_name))):
+            self._rescale_traced(mass, vol_slurry)
+            return
+
         if vol_slurry <= 0:
             if mass == 0:
                 return
@@ -1549,6 +1622,37 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
 
         setattr(self,self.distribution_state_name,distribution * factor)
 
+    def _rescale_traced(self, mass, vol_slurry):
+        """set_mass for a traced mass, with where in place of each branch.
+
+        A zero target empties the population, a positive one rescales it,
+        and with no slurry volume a zero mass leaves it alone. Where the
+        numeric path raises -- a mass without a volume, or a target for an
+        empty population -- a trace cannot, so the population becomes NaN
+        and the integrator stops on it.
+        """
+        name = self.distribution_state_name
+        distribution = getattr(self, name)
+
+        known = vol_slurry > 0
+        target_m3 = mass / (
+            self.getDensity()
+            * self.kv
+            * self.VOLUME_UNIT_FACTOR
+            * np.where(known, vol_slurry, 1.0)
+        )
+        current_m3 = self.compute_third_moment(self.true_state(distribution))
+        positive = current_m3 > 0
+
+        factor = np.where(
+            target_m3 == 0, 0.0,
+            np.where(positive,
+                     target_m3 / np.where(positive, current_m3, 1.0),
+                     np.nan))
+        factor = np.where(known, factor, np.where(mass == 0, 1.0, np.nan))
+
+        setattr(self, name, distribution * factor)
+
     @staticmethod
     def _cell_widths(x_grid):
         """Width of the finite volume cell around each grid node.
@@ -1602,9 +1706,9 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
 
     def solid_volume_fraction(self, value):
         """Solid volume per m3 of slurry, from a number density."""
-        return float(self.kv
-                     * self.compute_third_moment(value)
-                     * self.VOLUME_UNIT_FACTOR)
+        return np.as_float(self.kv
+                           * self.compute_third_moment(value)
+                           * self.VOLUME_UNIT_FACTOR)
     def solve_population_balance(
         self,
         liquid:BasePhase,
@@ -1660,19 +1764,27 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         gparams = self.mechanism_kinetics.params["growth"]
 
         boundary = nucl / np.maximum(growth, eps)
-        f_aug = np.concatenate(([boundary, boundary],csd,[csd[-1]]))
+        f_aug = np.concatenate((np.array([boundary, boundary]), csd,
+                                np.array([csd[-1]])))
         self._timers['pop_balance_compute_boundary'] = self._timers.get('pop_balance_compute_boundary',0)+perf_counter()-t0
         t0 = perf_counter()
         # Flux source terms
         f_diff = np.diff(f_aug)
-        if growth > 0:
+        # Upwind ratio, from the side the crystals grow from. A trace takes
+        # both and lets where choose, since it cannot ask the sign.
+        if np.is_traced(growth):
+            theta = np.where(growth > 0,
+                             f_diff[:-1] / (f_diff[1:] + eps * 10),
+                             f_diff[1:] / (f_diff[:-1] + eps * 10))
+        elif growth > 0:
             theta = (f_diff[:-1]/ (f_diff[1:] + eps * 10))
         else:
             theta = (f_diff[1:]/ (f_diff[:-1] + eps * 10))
 
         #Van-Leer limiter
         limiter = np.zeros_like(f_diff)
-        limiter[:-1] = ((np.abs(theta) + theta)/ (1 + np.abs(theta)))
+        limiter = np.set_at(limiter, slice(None, -1),
+                            (np.abs(theta) + theta) / (1 + np.abs(theta)))
         self._timers['pop_balance_compute_limiter'] = self._timers.get('pop_balance_compute_limiter',0)+perf_counter()-t0
 
         # t0 = perf_counter()
@@ -1904,6 +2016,24 @@ class MomentsPopulationBalance(PopulationBalanceMechanism):
 
         vol_slurry = self._slurry_volume(self.true_state(moments))
 
+        if np.is_traced((value, vol_slurry, moments)):
+            # The branches below as where, as in OneDFVMMechanism; NaN
+            # stands in for each error a trace cannot raise.
+            known = vol_slurry > 0
+            target_mu3 = value / (self.density * self.kv * 1e-18
+                                  * np.where(known, vol_slurry, 1.0))
+            current = self.true_state(moments)[3]
+            positive = current > 0
+            factor = np.where(
+                target_mu3 == 0, 0.0,
+                np.where(positive,
+                         target_mu3 / np.where(positive, current, 1.0),
+                         np.nan))
+            factor = np.where(known, factor,
+                              np.where(value == 0, 1.0, np.nan))
+            setattr(self, self.moments_state_name, moments * factor)
+            return
+
         if vol_slurry <= 0:
             if value == 0:
                 return
@@ -1945,7 +2075,7 @@ class MomentsPopulationBalance(PopulationBalanceMechanism):
         if len(moments) < 4:
             return 0.0
 
-        return float(self.kv * moments[3] * self.VOLUME_UNIT_FACTOR)
+        return np.as_float(self.kv * moments[3] * self.VOLUME_UNIT_FACTOR)
 
     def solve_population_balance(
         self,
@@ -1986,7 +2116,7 @@ class MomentsPopulationBalance(PopulationBalanceMechanism):
         # Per m3 of slurry, then made extensive. mu_2 is micron**2 and
         # growth micron/s, so (1e-6)**3 converts to m3/s. The true moments
         # and the unscaled nucleation rate, not the conditioned state.
-        mass_transfer = float(np.atleast_1d(
+        mass_transfer = np.as_float(np.atleast_1d(
             self.density * self.kv
             * (3 * (growth + dissol) * mu_true[2]
                + nucl_intensive * self.rad ** 3)

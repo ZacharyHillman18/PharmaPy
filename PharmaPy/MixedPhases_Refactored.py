@@ -9,7 +9,7 @@ old unit operations still import; nothing here depends on them.
 
 from PharmaPy.Phases_Refactored import BasePhase
 from collections import defaultdict
-import numpy as np
+from PharmaPy import xp as np
 import copy
 
 class MixedPhase:
@@ -120,10 +120,9 @@ class MixedPhase:
         masses = np.array([phase.mass for phase in phases], dtype=float) 
 
         total_mass = masses.sum()
-        if total_mass > 0:
-            weights = masses / total_mass
-        else:
-            weights = np.ones(len(phases), dtype=float) / len(phases)
+        positive = total_mass > 0
+        weights = np.where(positive, masses / np.where(positive, total_mass, 1.0),
+                           np.ones(len(phases), dtype=float) / len(phases))
 
         attrs = [getattr(phase, name, None) for phase in phases]
 
