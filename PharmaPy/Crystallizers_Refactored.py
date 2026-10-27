@@ -16,7 +16,8 @@ class _BaseCrystallizer(MultiPhaseVessel):
     def CrystKinetics(self):
         raise AttributeError(
             "CrystKinetics is a convenience initializer only. Modify self.phase_connections directly instead."
-            "Use phase_connections[ind].kinetics if the kinetics are desired."
+            "The kinetics belong to the population balance: use "
+            "phase_connections[ind].mechanism.mechanism_kinetics."
         )
 
     @CrystKinetics.setter
@@ -83,7 +84,6 @@ class _BaseCrystallizer(MultiPhaseVessel):
                 # liquid to solid because crystallization is valid
                 connection = PhaseConnection(source_phaseref=PhaseRef("liquid",0),
                                              sink_phaseref=solidphase_ref,
-                                             kinetics=ck,
                                              species_weights=weights,
                                              active_condition=lambda source,sink:True,
                                              mechanism=reversible.forward
@@ -93,7 +93,6 @@ class _BaseCrystallizer(MultiPhaseVessel):
                 #solid to liquid because dissolution
                 connection = PhaseConnection(source_phaseref=PhaseRef("solid",0),
                                              sink_phaseref=PhaseRef('liquid',0),
-                                             kinetics=ck,
                                              species_weights=weights,
                                              active_condition=lambda source,sink:True,
                                              mechanism=reversible.reverse

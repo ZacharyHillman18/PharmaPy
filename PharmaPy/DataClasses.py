@@ -28,11 +28,26 @@ class PhaseRef:
 
 @dataclass
 class PhaseConnection:
+    """
+    Material exchanged between two phases of one vessel.
+
+    What moves, and how fast, is the mechanism's business: a population
+    balance carries its crystallization kinetics, a DirectTransfer its rate
+    law. The connection only names the two phases. (It used to require a
+    kinetics object as well, left over from an architecture in which the
+    connection evaluated the rate; nothing read it, and it made a
+    connection whose mechanism needs no kinetics impossible to build.)
+
+    species_weights
+        How a mechanism that computes a total rate splits it across species
+        (DirectTransfer does, when its rate is a scalar).
+    active_condition
+        Called with the source and sink phases; the transfer is skipped
+        while it returns False.
+    """
     #TODO move this to connections when done
-    #active_condition checks the source sink and temp and must return a boolean
     source_phaseref: PhaseRef
     sink_phaseref: PhaseRef
-    kinetics:pk.CrystKinetics|pk.RxnKinetics
     species_weights: np.ndarray | None = None
     active_condition: callable=lambda source_phase,sink_phase:True
     mechanism:"CrossPhaseTransferMechanism | None" = None

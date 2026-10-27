@@ -724,8 +724,11 @@ class JaxAssimuloBackend(AssimuloBackend):
         import_jax()
 
         # A fresh dict per instance; AssimuloBackend's own default is one
-        # dict shared by every instance.
-        super().__init__(options=dict(options) if options else {'maxh': 1})
+        # dict shared by every instance. Only None takes the default: an
+        # empty dict means no options, as it does for AssimuloBackend (it
+        # used to fall to maxh=1, which on a six-hour CSTR is 21,600 steps).
+        super().__init__(options={'maxh': 1} if options is None
+                         else dict(options))
 
         self.exact_jacobian = bool(exact_jacobian)
         self.model = None

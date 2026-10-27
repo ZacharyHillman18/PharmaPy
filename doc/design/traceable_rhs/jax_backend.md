@@ -196,7 +196,8 @@ Consequences:
   values into the compiled function from outside; the same path carries `u`.
 
 This reopens the earlier "controllers own no solver states" decision, which
-is why it is a design here and not code.
+is why it is a design here and not code. *It was implemented afterwards, on
+branch `ControllerSolverStates`; see `../controller_solver_states.md`.*
 
 ## 3. Is it faster than finite differences, and by how much
 

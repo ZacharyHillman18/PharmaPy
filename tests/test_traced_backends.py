@@ -276,6 +276,20 @@ def test_exact_jacobian_matches_central_differences(jax):
     assert model.patched_columns == 0
 
 
+def test_jax_assimulo_options_follow_assimulo_backend(jax):
+    """An empty dict means no options, as for AssimuloBackend; only None
+    takes the default. (Empty used to fall to maxh=1: 21,600 steps on a
+    six-hour CSTR.) And no two instances share one dict."""
+    from PharmaPy.TracedBackends import JaxAssimuloBackend
+
+    assert JaxAssimuloBackend(options={}).options == {}
+    assert JaxAssimuloBackend().options == {'maxh': 1}
+
+    first, second = JaxAssimuloBackend(), JaxAssimuloBackend()
+    first.options['maxh'] = 5
+    assert second.options == {'maxh': 1}
+
+
 def test_a_second_trace_is_refused(jax):
     """Tracing again would run the copy's objects on what the first trace
     left behind them; a different argument type would cause it."""

@@ -444,20 +444,115 @@ class ReactionMechanism(Mechanism):
 
     
 class DirectTransfer(CrossPhaseTransferMechanism):
+    """
+    Move species from a connection's source phase to its sink at a rate the
+    mechanism owns.
+
+    ``rate`` is the mass flow from source to sink, in kg/s:
+
+    * a callable, ``rate(source_phase, sink_phase, time, completed_state)``;
+    * or a constant.
+
+    An array gives the flow of each species, and a negative entry flows the
+    other way. A scalar is a total, split across species by the connection's
+    ``species_weights`` when it has them, otherwise in the proportions of the
+    source phase's own composition (the source gives material up as it is).
+
+    ``heat_of_transfer`` is the enthalpy change of the material moved, in J
+    per kg moved from source to sink (sink minus source, so negative when
+    the transfer releases heat, as a condensation does). The energy balance
+    receives -heat_of_transfer times the net mass moved.
+
+    The vessel's positivity limiter scales this transfer like any other, so
+    a rate that would empty the source is throttled rather than driving it
+    negative. On a traced backend a callable rate runs under the tracer, so
+    it must follow the PharmaPy.xp rules.
+
+    The phases' material states must be on a mass basis (``mass_j``, the
+    vessel default).
+    """
+
+    def __init__(self, rate, heat_of_transfer=0.0):
+        super().__init__()
+        self.rate = rate
+        self.heat_of_transfer = heat_of_transfer
+
+    @classmethod
+    def first_order(cls, rate_constant, species=None, heat_of_transfer=0.0):
+        """
+        Transfer at ``rate_constant`` (1/s) times the source's mass of each
+        species. ``species`` names the species that move; None moves all.
+        """
+
+        def rate(source_phase, sink_phase, time, completed_state):
+            flows = rate_constant * source_phase.mass_j
+
+            if species is not None:
+                moving = np.array([name in species
+                                   for name in source_phase.name_species],
+                                  dtype=float)
+                flows = flows * moving
+
+            return flows
+
+        return cls(rate, heat_of_transfer)
+
+    def species_flows(self, source_phase, sink_phase, connection,
+                      completed_state, time):
+        """kg/s of each species, from source to sink."""
+
+        if callable(self.rate):
+            flows = self.rate(source_phase, sink_phase, time, completed_state)
+        else:
+            flows = self.rate
+
+        flows = np.asarray(flows, dtype=float)
+
+        if flows.ndim == 0:
+            weights = connection.species_weights
+
+            if weights is None:
+                weights = source_phase.mass_frac
+
+            flows = flows * np.asarray(weights, dtype=float)
+
+        return flows
 
     def get_solver_state_rates(
             self,
             source_phase,
             sink_phase,
-            kinetics,
-            **kwargs):
+            connection,
+            completed_state,
+            time,
+        ) -> TransferResult:
 
-        return kinetics.get_rate(
-            source_phase,
-            sink_phase,
-            **kwargs
+        source_key = StateKey('mass_j', connection.source_phaseref)
+        sink_key = StateKey('mass_j', connection.sink_phaseref)
+
+        if source_key not in completed_state or sink_key not in completed_state:
+            raise ValueError(
+                "DirectTransfer moves mass between phases whose material "
+                f"states are mass_j; {source_key} or {sink_key} is not a "
+                "state of this vessel.")
+
+        flows = self.species_flows(source_phase, sink_phase, connection,
+                                   completed_state, time)
+        net = np.sum(flows)
+
+        return TransferResult(
+            state_rates={source_key: -flows, sink_key: flows},
+            aux={
+                "connection": connection,
+                "species_flows": flows,
+                "net_mass_rate": net,
+            },
+            net_mass_rate=net,
         )
-    
+
+    def get_heat_generation(self, aux, completed_state, time):
+        return -self.heat_of_transfer * aux["net_mass_rate"]
+
 class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
     """
     Base class for crystallization population balance mechanisms.

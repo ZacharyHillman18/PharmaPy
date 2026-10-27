@@ -817,6 +817,10 @@ class MultiPhaseVessel():
             # in that list, so its states have to be found directly.
             return self.get_mechanism_state_value(statekey)
 
+        # a solver state the controller integrates itself
+        if self.controller.owns_state(statekey):
+            return self.controller.initial_solver_state(statekey, self)
+
         # unit operation state
         value = getattr(self, statekey.name, None)
 
@@ -991,6 +995,13 @@ class MultiPhaseVessel():
                 overwrite=overwrite,
                 phase_ref=process.phaseref,
             )
+
+        # A controller's own memory (an integral, a filtered measurement):
+        # global states, owned by no phase.
+        self.controller.add_solver_state_variables(
+            self.solver_state_collection,
+            overwrite=overwrite,
+        )
     def define_output_states(self,overwrite=False):
         self.recorded_output_history ={}
         self.output_state_collection.add(
@@ -1185,7 +1196,7 @@ class MultiPhaseVessel():
             operating_conditions=None,
         ):
         temp = completed_state[StateKey("global_temp")]
-        temp_ht = context.Utility.temp_in
+        temp_ht = context.utility_temperature(operating_conditions or {})
 
         return context.get_heat_transfer_rate(
             temp,
@@ -1246,6 +1257,8 @@ class MultiPhaseVessel():
 
         for mechanism in getattr(self, "_workspace_mechanisms", ()):
             mechanism.update_state(completed_state, unit=self)
+
+        self.controller.update_solver_states(completed_state)
 
     def pack_state_rates(self, material_rates=None, global_rates=None,
                          algebraic_residuals=None):
@@ -1362,6 +1375,14 @@ class MultiPhaseVessel():
             self._timers['energy_balances_total'] = self._timers.get('energy_balances_total',0)+perf_counter()-t0
             global_rates.update(energy_rates)
 
+        # The controller's own solver states, given the streams and
+        # operating conditions this evaluation actually applied.
+        controller_rates = self.controller.get_solver_state_rates(
+            time, completed_state, self, **self._evaluated_streams())
+
+        if controller_rates:
+            global_rates.update(controller_rates)
+
         # utility_rates = self.utility_energy_balance(
         #     time,completed_state)
         # global_rates.update(utility_rates)
@@ -1435,10 +1456,17 @@ class MultiPhaseVessel():
             if key.name == self.basis:
                 self._material_slice_by_phase[key.phaseref] = material_slice
 
-        # Default cross-phase transfer mechanisms
+        # Every phase connection says how material moves. (A connection with
+        # no mechanism used to be handed a DirectTransfer with no rate law,
+        # which failed on the first right-hand side evaluation.)
         for connection in self._phase_connections:
             if connection.mechanism is None:
-                connection.mechanism = DirectTransfer()
+                raise ValueError(
+                    "The PhaseConnection from "
+                    f"{connection.source_phaseref} to "
+                    f"{connection.sink_phaseref} has no mechanism. Give it "
+                    "one, such as DirectTransfer(rate) or "
+                    "DirectTransfer.first_order(k).")
 
         self._compile_stream_workspaces()
         self._compile_positivity_layout()
@@ -2126,6 +2154,12 @@ class MultiPhaseVessel():
             if contribution:
                 residuals.update(contribution)
 
+        contribution = self.controller.get_solver_state_residuals(
+            time, completed_state, self, **self._evaluated_streams())
+
+        if contribution:
+            residuals.update(contribution)
+
         missing = [
             key for key in self.solver_state_collection.algebraic_keys
             if key not in residuals
@@ -2133,13 +2167,28 @@ class MultiPhaseVessel():
 
         if missing:
             raise KeyError(
-                "No mechanism supplied a residual for algebraic state(s) "
-                f"{[str(key) for key in missing]}. Every state registered "
-                "with state_type='alg' must be returned by some mechanism's "
+                "No mechanism or controller supplied a residual for "
+                f"algebraic state(s) {[str(key) for key in missing]}. Every "
+                "state registered with state_type='alg' must be returned by "
+                "some mechanism's or the controller's "
                 "get_solver_state_residuals."
             )
 
         return residuals
+
+    def _evaluated_streams(self):
+        """The streams and operating conditions of the current evaluation.
+
+        material_balances records them; they are what the controller actually
+        applied at this point, which its own state rates may depend on.
+        """
+        point = self._last_evaluation or {}
+
+        return {
+            "resolved_inlets": point.get("resolved_inlets"),
+            "resolved_outlets": point.get("resolved_outlets"),
+            "operating_conditions": point.get("operating_conditions"),
+        }
 
     def material_balances(
         self,
@@ -3157,7 +3206,26 @@ class MultiPhaseVessel():
     def get_heat_transfer_temperature(self):
         """The temperature to use to determine heat transfer from the vessel. The default assumption is to use the temperature of the first liquid phase"""
         return self.Phases[0].temp
-    
+
+    # The jacket inlet temperature as a manipulated variable. A controller
+    # that sets this operating condition overrides Utility.temp_in for that
+    # evaluation; it belongs to no stream, so stream resolution never sees it.
+    UTILITY_TEMPERATURE = OperatingKey("temp_in", port="utility")
+
+    def utility_temperature(self, operating_conditions=None):
+        """The jacket temperature in force: the controller's, or the utility's.
+
+        ``operating_conditions`` defaults to those of the evaluation in
+        progress (material_balances records them before the energy balance
+        runs).
+        """
+        if operating_conditions is None:
+            point = self._last_evaluation or {}
+            operating_conditions = point.get("operating_conditions") or {}
+
+        return operating_conditions.get(self.UTILITY_TEMPERATURE,
+                                        self.Utility.temp_in)
+
     def add_utility_energy_terms(
             self,
             contributions,
@@ -3169,7 +3237,7 @@ class MultiPhaseVessel():
             return
 
         temp = self.get_heat_transfer_temperature()
-        temp_ht = self.Utility.temp_in#completed_state[StateKey("temp_ht")]
+        temp_ht = self.utility_temperature()
 
         qdot = self.get_heat_transfer_rate(temp, temp_ht)
                                            
