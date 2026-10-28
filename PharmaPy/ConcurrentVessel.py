@@ -1490,6 +1490,49 @@ class ConcurrentVessel:
 
         return self.result
 
+    def retrieve_sensitivities(self, time, solver_states, sensitivities,
+                               parameters, output_tangents=None):
+        """
+        Each member's solver-state sensitivities, on its own result.
+
+        As MultiPhaseVessel.retrieve_sensitivities, for the members' solver
+        states only: an output state of one member depends on the others
+        through the couplings, and the joint replay that computes it is not
+        differentiated yet. ``output_tangents`` is ignored.
+        """
+
+        time = np.asarray(time, dtype=float).reshape(-1)
+        sensitivities = np.asarray(sensitivities, dtype=float).reshape(
+            time.size, np.shape(solver_states)[-1], -1)
+
+        fields = {}
+
+        for name in self.order:
+            member = self.members[name]
+            collection = member.solver_state_collection
+            block = sensitivities[:, self._member_slices[name], :]
+
+            member_fields = {}
+
+            for key, state_slice, state in zip(collection.keys,
+                                               collection.slices.values(),
+                                               collection.state_values):
+                values = block[:, state_slice, :]
+
+                if state.dim == 1:
+                    values = values[:, 0, :]
+
+                member_fields[collection.format_key(key)] = values
+
+            member.result.sensitivities = member_fields
+            member.result.param_names = parameters.free_names
+            fields[name] = member_fields
+
+        self.result.sensitivities = fields
+        self.result.param_names = parameters.free_names
+
+        return fields
+
     def build_solver_history(self, time, solver_states):
         return {
             name: self.members[name].build_solver_history(
@@ -1497,7 +1540,7 @@ class ConcurrentVessel:
             for name in self.order
         }
 
-    def create_pseudo(self):
+    def create_pseudo(self, memo=None):
         """
         Independent copies of every member, for the joint replay.
 
@@ -1507,10 +1550,16 @@ class ConcurrentVessel:
         watching a neighbour -- therefore lands on that neighbour's pseudo,
         which the replay keeps at the right state, rather than on a frozen
         copy of the real vessel taken at the end of the run.
+
+        ``memo``, when given, is filled in, so a caller can find the copy of
+        any object inside (PharmaPy.Parameters.bind does).
         """
 
-        memo = {id(member): object.__new__(type(member))
-                for member in self.members.values()}
+        if memo is None:
+            memo = {}
+
+        for member in self.members.values():
+            memo.setdefault(id(member), object.__new__(type(member)))
 
         members = {name: member.create_pseudo(memo)
                    for name, member in self.members.items()}

@@ -301,7 +301,7 @@ def test_a_second_trace_is_refused(jax):
 
     with pytest.raises(RuntimeError, match="traced a second time"):
         model._rhs(np.float32(time), states.astype(np.float32),
-                   model.inputs(time))
+                   model.inputs(time), model.parameter_values)
 
 
 def _final(unit):

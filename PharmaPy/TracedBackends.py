@@ -23,10 +23,19 @@ Events and the replay are unchanged. Event functions are evaluated on the unit
 itself, numerically, exactly as under ScipyBackend and AssimuloBackend, and
 retrieve_results replays the accepted trajectory through the unit's own code.
 
+The compiled function is kept from solve to solve. Numbers declared as
+parameters (PharmaPy.Parameters) are inputs of it, so they can change between
+solves without a new trace, and sensitivities with respect to them
+(eval_sens=True; JaxAssimuloBackend and CasadiBackend) are exact. Any other
+number the trace read is frozen into it; before reusing it, each backend
+checks it against the unit and traces again, with a warning, if one has
+changed (TracedModel.matches).
+
 JAX and CasADi are optional: neither is imported until one of these backends
 is constructed.
 """
 
+import warnings
 from time import perf_counter
 
 import numpy as np
@@ -95,6 +104,121 @@ def _state_argument(states):
     return np.ascontiguousarray(states, dtype=np.float64)
 
 
+def _parameter_argument(values):
+    return np.ascontiguousarray(values, dtype=np.float64).reshape(-1)
+
+
+class _Traced:
+    """
+    ``evaluate(copy, time, states)`` compiled as f(time, states, inputs, params).
+
+    Steps 2-4 of TracedModel, for any function of a copy of the unit: its
+    right-hand side, or the replay's output states. ``params`` is the
+    declared parameters' full vector (empty when none are declared); inside
+    the trace it is written to the copy's owners before ``evaluate`` runs,
+    so the compiled function reads it rather than the numbers the owners
+    held when it was traced.
+    """
+
+    def __init__(self, jax, unit, evaluate, time, states, parameters):
+
+        self.traces = 0
+        self.time_functions = []
+
+        start = _time_argument(time)
+        states = _state_argument(states)
+        values = _parameter_argument(
+            () if parameters is None else parameters.values())
+
+        def copy_of_unit():
+            memo = {}
+            pseudo = unit.create_pseudo(memo)
+            bound = None if parameters is None else parameters.bind(memo)
+            return pseudo, bound
+
+        recorded = []
+        discovery, discovery_parameters = copy_of_unit()
+
+        def discover(time, states, params):
+            if discovery_parameters is not None:
+                discovery_parameters.assign(params)
+
+            return jax.numpy.asarray(evaluate(discovery, time, states))
+
+        with xp.tracing_at(float(time)), xp.time_inputs(record=recorded):
+            self.shape = jax.eval_shape(discover, start, states, values).shape
+
+        self.input_shapes = [shape for shapes in recorded for shape in shapes]
+
+        self.pseudo, bound = copy_of_unit()
+        pseudo = self.pseudo
+
+        def function(time, states, inputs, params):
+            # Runs only while JAX traces. A second trace would run the copy's
+            # objects with values the first left behind, so it is refused.
+            self.traces += 1
+
+            if self.traces > 1:
+                raise RuntimeError(
+                    "The right-hand side was traced a second time. Call the "
+                    "compiled function with float64 arguments of fixed "
+                    "shape, as TracedModel's methods do."
+                )
+
+            if bound is not None:
+                bound.assign(params)
+
+            with xp.time_inputs(supply=inputs) as supplied:
+                out = jax.numpy.asarray(evaluate(pseudo, time, states))
+
+            if supplied.used != len(inputs):
+                raise RuntimeError(
+                    "The trace met different functions of time the second "
+                    "time through, so they cannot be passed in as inputs.")
+
+            self.time_functions = supplied.functions
+
+            return out
+
+        self.compiled = jax.jit(function)
+
+        placeholder = [np.zeros(shape) for shape in self.input_shapes]
+
+        with xp.tracing_at(float(time)):
+            self.compiled(start, states, placeholder, values
+                          ).block_until_ready()
+
+    def inputs(self, time):
+        """The functions of time the trace could not follow, at ``time``."""
+
+        values = []
+
+        for function in self.time_functions:
+            leaves, _ = xp._flatten(function(float(time)))
+            values += [np.asarray(leaf, dtype=np.float64) for leaf in leaves]
+
+        return values
+
+
+def _tangent_function(jax, compiled):
+    """
+    Directional derivatives of compiled f(t, y, inputs, p) along several
+    (dy, dp) pairs at once: one jvp per column, mapped, never forming the
+    Jacobian. Columns of ``dy`` pair with rows of ``dp``.
+    """
+
+    def tangents(time, states, inputs, params, dy, dp):
+
+        def column(state_direction, parameter_direction):
+            return jax.jvp(lambda y, p: compiled(time, y, inputs, p),
+                           (states, params),
+                           (state_direction, parameter_direction))[1]
+
+        return jax.vmap(column, in_axes=(1, 0), out_axes=-1)(dy, dp)
+
+    return jax.jit(tangents)
+
+
 class TracedModel:
     """
     A unit's right-hand side compiled by JAX, with its exact derivatives.
@@ -118,17 +242,28 @@ class TracedModel:
        derived from the compiled function, never by running the Python
        objects again, which would read the traced values left behind.
 
-    All methods take and return numpy arrays.
+    Every other number the copy holds is frozen into the compiled function.
+    ``parameters`` (PharmaPy.Parameters) names numbers to pass in instead:
+    their values are read from the unit's own objects by refresh_parameters,
+    which the backends call before each solve, so new values need no new
+    trace. ``matches`` tells whether anything else has changed since.
+
+    All methods take and return numpy arrays. ``params``, where a method
+    takes it, is a full parameter vector to use instead of the refreshed
+    one.
     """
 
-    def __init__(self, unit, time, states):
+    def __init__(self, unit, time, states, parameters=None):
 
         jax = import_jax()
 
         self.jax = jax
         self.n_states = int(np.size(states))
         self.start_time = float(time)
-        self.traces = 0
+
+        self.parameters = parameters
+        self.parameter_values = _parameter_argument(
+            () if parameters is None else parameters.values())
 
         # How often a non-finite exact derivative was replaced by a
         # difference quotient (see jac and jvp).
@@ -136,64 +271,41 @@ class TracedModel:
         self.patched_products = 0
 
         # Calls made by the integrator, for comparing backends.
-        self.counts = {"rhs": 0, "jac": 0, "jvp": 0}
+        self.counts = {"rhs": 0, "jac": 0, "jvp": 0, "sens": 0}
 
         t0 = perf_counter()
 
         states = _state_argument(states)
-        start = _time_argument(time)
         unit.unit_model(time, states)
 
-        recorded = []
-        discovery = unit.create_pseudo()
+        self._traced = _Traced(
+            jax, unit, lambda pseudo, t, y: pseudo.unit_model(t, y),
+            time, states, parameters)
 
-        with xp.tracing_at(self.start_time), xp.time_inputs(record=recorded):
-            jax.eval_shape(
-                lambda t, y: jax.numpy.asarray(discovery.unit_model(t, y)),
-                start, states)
+        self._rhs = self._traced.compiled
+        self.pseudo = self._traced.pseudo
 
-        self.input_shapes = [shape for shapes in recorded for shape in shapes]
-        self.time_functions = []
-
-        self.pseudo = unit.create_pseudo()
-        pseudo = self.pseudo
-
-        def rhs(time, states, inputs):
-            # Runs only while JAX traces. A second trace would run the copy's
-            # objects with values the first left behind, so it is refused.
-            self.traces += 1
-
-            if self.traces > 1:
-                raise RuntimeError(
-                    "The right-hand side was traced a second time. Call the "
-                    "compiled function with float64 arguments of fixed "
-                    "shape, as TracedModel's methods do."
-                )
-
-            with xp.time_inputs(supply=inputs) as supplied:
-                rates = jax.numpy.asarray(pseudo.unit_model(time, states))
-
-            if supplied.used != len(inputs):
-                raise RuntimeError(
-                    "The trace met different functions of time the second "
-                    "time through, so they cannot be passed in as inputs.")
-
-            self.time_functions = supplied.functions
-
-            return rates
-
-        self._rhs = jax.jit(rhs)
         self._jac = None
         self._jvp = None
         self._jac_time = None
-
-        placeholder = [np.zeros(shape) for shape in self.input_shapes]
-
-        with xp.tracing_at(self.start_time):
-            self._rhs(start, states, placeholder).block_until_ready()
+        self._jac_params = None
+        self._sens = None
+        self._directions = {}
 
         self.trace_seconds = perf_counter() - t0
         self.jacobian_seconds = None
+
+    @property
+    def traces(self):
+        return self._traced.traces
+
+    @property
+    def input_shapes(self):
+        return self._traced.input_shapes
+
+    @property
+    def time_functions(self):
+        return self._traced.time_functions
 
     # ------------------------------------------------------------------
     # Compiled functions
@@ -202,25 +314,28 @@ class TracedModel:
     def inputs(self, time):
         """The functions of time the trace could not follow, at ``time``."""
 
-        values = []
+        return self._traced.inputs(time)
 
-        for function in self.time_functions:
-            leaves, _ = xp._flatten(function(float(time)))
-            values += [np.asarray(leaf, dtype=np.float64) for leaf in leaves]
+    def refresh_parameters(self):
+        """Read the declared parameters' current values from their owners."""
 
-        return values
+        if self.parameters is not None:
+            self.parameter_values = _parameter_argument(
+                self.parameters.values())
 
-    def _arguments(self, time, states):
+    def _arguments(self, time, states, params=None):
         return (_time_argument(time), _state_argument(states),
-                self.inputs(time))
+                self.inputs(time),
+                self.parameter_values if params is None
+                else _parameter_argument(params))
 
-    def rhs(self, time, states):
+    def rhs(self, time, states, params=None):
         self.counts["rhs"] += 1
 
-        return np.array(self._rhs(*self._arguments(time, states)),
+        return np.array(self._rhs(*self._arguments(time, states, params)),
                         dtype=float)
 
-    def jac(self, time, states):
+    def jac(self, time, states, params=None):
         """Exact d(rhs)/d(states), dense.
 
         A column whose exact derivative is not finite is replaced by a
@@ -234,32 +349,34 @@ class TracedModel:
             t0 = perf_counter()
 
             self._jac = self.jax.jit(self.jax.jacfwd(self._rhs, argnums=1))
-            self._jac(*self._arguments(time, states)).block_until_ready()
+            self._jac(*self._arguments(time, states, params)
+                      ).block_until_ready()
 
             self.jacobian_seconds = perf_counter() - t0
 
         self.counts["jac"] += 1
 
-        jacobian = np.array(self._jac(*self._arguments(time, states)),
+        jacobian = np.array(self._jac(*self._arguments(time, states, params)),
                             dtype=float)
 
         bad = ~np.isfinite(jacobian).all(axis=0)
 
         if bad.any():
             states = _state_argument(states)
-            base = self.rhs(time, states)
+            base = self.rhs(time, states, params)
 
             for column in np.flatnonzero(bad):
                 step = self._difference_step(states[column])
                 shifted = states.copy()
                 shifted[column] += step
-                jacobian[:, column] = (self.rhs(time, shifted) - base) / step
+                jacobian[:, column] = (self.rhs(time, shifted, params)
+                                       - base) / step
 
             self.patched_columns += int(bad.sum())
 
         return jacobian
 
-    def jvp(self, time, states, vector):
+    def jvp(self, time, states, vector, params=None):
         """Exact d(rhs)/d(states) times a vector, without forming the matrix.
 
         Falls back to a directional difference when the exact product is not
@@ -270,9 +387,9 @@ class TracedModel:
             jax = self.jax
             rhs = self._rhs
 
-            def jvp(time, states, inputs, vector):
-                return jax.jvp(lambda y: rhs(time, y, inputs), (states,),
-                               (vector,))[1]
+            def jvp(time, states, inputs, params, vector):
+                return jax.jvp(lambda y: rhs(time, y, inputs, params),
+                               (states,), (vector,))[1]
 
             self._jvp = jax.jit(jvp)
 
@@ -282,15 +399,16 @@ class TracedModel:
         self.counts["jvp"] += 1
 
         product = np.array(
-            self._jvp(*self._arguments(time, states), vector), dtype=float)
+            self._jvp(*self._arguments(time, states, params), vector),
+            dtype=float)
 
         if not np.isfinite(product).all():
             norm = np.linalg.norm(vector)
 
             if norm > 0:
                 step = self._difference_step(np.linalg.norm(states)) / norm
-                product = (self.rhs(time, states + step * vector)
-                           - self.rhs(time, states)) / step
+                product = (self.rhs(time, states + step * vector, params)
+                           - self.rhs(time, states, params)) / step
 
             self.patched_products += 1
 
@@ -300,7 +418,7 @@ class TracedModel:
     def _difference_step(value):
         return np.sqrt(np.finfo(float).eps) * max(1.0, abs(float(value)))
 
-    def jac_time(self, time, states):
+    def jac_time(self, time, states, params=None):
         """d(rhs)/d(time).
 
         Exact when everything time-dependent in the model was traced. A
@@ -316,41 +434,278 @@ class TracedModel:
                 try:
                     compiled = self.jax.jit(
                         self.jax.jacfwd(self._rhs, argnums=0))
-                    compiled(*self._arguments(time, states)
+                    compiled(*self._arguments(time, states, params)
                              ).block_until_ready()
                     self._jac_time = compiled
                 except Exception:
                     pass
 
         if self._jac_time:
-            return np.array(self._jac_time(*self._arguments(time, states)),
-                            dtype=float).reshape(-1, 1)
+            return np.array(
+                self._jac_time(*self._arguments(time, states, params)),
+                dtype=float).reshape(-1, 1)
 
         step = np.sqrt(np.finfo(float).eps) * max(1.0, abs(float(time)))
 
-        return ((self.rhs(time + step, states) - self.rhs(time, states))
-                / step).reshape(-1, 1)
+        return ((self.rhs(time + step, states, params)
+                 - self.rhs(time, states, params)) / step).reshape(-1, 1)
+
+    # ------------------------------------------------------------------
+    # Parameters
+    # ------------------------------------------------------------------
+
+    def jac_params(self, time, states, params=None):
+        """Exact d(rhs)/d(parameters), dense, every declared parameter.
+
+        A non-finite column is replaced by a forward difference, as in jac.
+        """
+
+        if self._jac_params is None:
+            self._jac_params = self.jax.jit(
+                self.jax.jacfwd(self._rhs, argnums=3))
+
+        arguments = self._arguments(time, states, params)
+        jacobian = np.array(self._jac_params(*arguments), dtype=float)
+
+        bad = ~np.isfinite(jacobian).all(axis=0)
+
+        if bad.any():
+            values = arguments[3].copy()
+            base = self.rhs(time, states, values)
+
+            for column in np.flatnonzero(bad):
+                step = self._difference_step(values[column])
+                shifted = values.copy()
+                shifted[column] += step
+                jacobian[:, column] = (self.rhs(time, states, shifted)
+                                       - base) / step
+
+        return jacobian
+
+    def _parameter_directions(self, free_index):
+        key = tuple(int(index) for index in free_index)
+
+        if key not in self._directions:
+            self._directions[key] = np.ascontiguousarray(
+                np.eye(self.parameter_values.size)[list(key)])
+
+        return self._directions[key]
+
+    def tangents(self, time, states, state_directions, parameter_directions,
+                 params=None):
+        """
+        d(rhs)/d(states) @ state_directions
+        + d(rhs)/d(params) @ parameter_directions.T, exact.
+
+        ``state_directions`` is (states, k) and ``parameter_directions``
+        (k, every declared parameter): column j of the result is the
+        derivative along the pair (state_directions[:, j],
+        parameter_directions[j]). One jvp per column, so neither Jacobian
+        is formed, which is what lets a Krylov-solved unit carry
+        sensitivities.
+        """
+
+        if self._sens is None:
+            self._sens = _tangent_function(self.jax, self._rhs)
+
+        state_directions = np.ascontiguousarray(
+            np.reshape(state_directions, (self.n_states, -1)),
+            dtype=np.float64)
+        parameter_directions = np.ascontiguousarray(
+            np.reshape(parameter_directions,
+                       (state_directions.shape[1], -1)), dtype=np.float64)
+        arguments = self._arguments(time, states, params)
+
+        self.counts["sens"] += 1
+
+        out = np.array(self._sens(*arguments, state_directions,
+                                  parameter_directions), dtype=float)
+
+        if not np.isfinite(out).all():
+            # Rare (see jac): the patched Jacobians instead.
+            out = (self.jac(time, states, arguments[3]) @ state_directions
+                   + self.jac_params(time, states, arguments[3])
+                   @ parameter_directions.T)
+
+        return out
+
+    def sens_rhs(self, time, states, sens, free_index, params=None):
+        """
+        The forward sensitivity equations' right-hand side,
+        d(rhs)/d(states) @ sens + d(rhs)/d(params)[:, free_index], exact.
+
+        ``sens`` is (states, free parameters); see tangents.
+        """
+
+        return self.tangents(time, states, sens,
+                             self._parameter_directions(free_index), params)
+
+    # ------------------------------------------------------------------
+    # Still the unit's model?
+    # ------------------------------------------------------------------
+
+    def matches(self, unit, time, states, rtol=1e-9):
+        """
+        Whether the compiled right-hand side still computes what the unit
+        does, at ``states`` and at a point nudged from it.
+
+        Everything the trace read that is not a declared parameter is frozen
+        into the compiled function: change a kinetic constant with
+        set_params, a controller's set point, a feed or the utility after
+        compiling, and the compiled function would go on with the old value
+        while the unit's own code uses the new one. This finds that out by
+        evaluating both. The two agree to about 1e-14 when nothing changed.
+
+        The nudged point (every state moved by up to 0.1%) catches a setting
+        that does not show at ``states`` itself, such as a controller gain
+        while its error is zero. ``states`` is evaluated last, so the unit is
+        left where it was.
+        """
+
+        states = _state_argument(states)
+        rng = np.random.default_rng(0)
+        nudged = states * (1 + 1e-3 * rng.uniform(-1, 1, states.size))
+
+        agree = True
+
+        for point in (nudged, states):
+            numeric = np.asarray(unit.unit_model(time, point), dtype=float)
+            compiled = np.asarray(self._rhs(*self._arguments(time, point)),
+                                  dtype=float)
+
+            finite = np.isfinite(numeric)
+            scale = np.max(np.abs(numeric[finite]), initial=0.0)
+
+            close = ((np.abs(compiled - numeric)
+                      <= rtol * np.abs(numeric) + 1e-12 * scale)
+                     | (compiled == numeric)
+                     | (np.isnan(compiled) & np.isnan(numeric)))
+
+            agree = agree and bool(close.all())
+
+        return agree
+
     # ------------------------------------------------------------------
     # CasADi
     # ------------------------------------------------------------------
 
-    def casadi_function(self, name="pharmapy_rhs"):
+    def casadi_function(self, name="pharmapy_rhs", free_index=None):
         """
         The compiled right-hand side as a casadi.Function f(t, x) -> dx/dt.
 
         Its derivatives are the exact ones above, so an integrator, a
         collocation transcription or an NLP built on it gets exact Jacobians
         from JAX. The returned function keeps the objects behind it alive.
+
+        ``free_index`` makes it f(t, x, p), p being those entries of the
+        declared parameters (the others keep their refreshed values).
         """
 
-        return _casadi_rhs(self, name)
+        return _casadi_rhs(self, name, free_index)
 
 
-def _casadi_rhs(model, name):
-    """casadi.Callback pair: f(t, x) and its Jacobian, evaluated by JAX."""
+class TracedOutputs:
+    """
+    The replay's output states compiled as h(time, states, params), and how
+    they move along sensitivity directions.
+
+    What is measured is mostly an output state -- a concentration, the
+    volume, a supersaturation -- computed from the solver states by the
+    replay (MultiPhaseVessel.output_states_at). Its sensitivity to a
+    parameter is dh/dy S + dh/dp, which this gives exactly, compiled the way
+    TracedModel compiles the right-hand side.
+    """
+
+    def __init__(self, unit, time, states, parameters=None):
+
+        jax = import_jax()
+
+        self.jax = jax
+
+        states = _state_argument(states)
+        sample = unit.create_pseudo().output_states_at(
+            float(time), unit.solver_state_collection.unpack(states))
+
+        # Where each output state sits in the flat vector h returns.
+        self.layout = []
+        start = 0
+
+        for key, value in sample.items():
+            shape = np.shape(value)
+            size = int(np.prod(shape, dtype=int))
+            self.layout.append((key, shape, slice(start, start + size)))
+            start += size
+
+        keys = [key for key, _, _ in self.layout]
+
+        def evaluate(pseudo, time, states):
+            values = pseudo.output_states_at(
+                time, pseudo.solver_state_collection.unpack(states))
+
+            return xp.concatenate([xp.ravel(xp.asarray(values[key],
+                                                       dtype=float))
+                                   for key in keys])
+
+        self._traced = _Traced(jax, unit, evaluate, time, states, parameters)
+        self._tangents = None
+
+    @property
+    def traces(self):
+        return self._traced.traces
+
+    def tangents(self, time, states, sens, free_index, params):
+        """{StateKey: (*shape, free)}: dh/dy @ sens + dh/dp[:, free_index]."""
+
+        if self._tangents is None:
+            self._tangents = _tangent_function(self.jax,
+                                               self._traced.compiled)
+
+        params = _parameter_argument(params)
+        directions = np.ascontiguousarray(
+            np.eye(params.size)[list(free_index)])
+
+        out = np.array(self._tangents(
+            _time_argument(time), _state_argument(states),
+            self._traced.inputs(time), params,
+            np.ascontiguousarray(sens, dtype=np.float64), directions),
+            dtype=float)
+
+        columns = out.shape[-1]
+
+        return {key: out[part].reshape(shape + (columns,))
+                for key, shape, part in self.layout}
+
+
+def _casadi_rhs(model, name, free_index=None):
+    """casadi.Callback pair: f(t, x) and its Jacobian, evaluated by JAX.
+
+    With ``free_index`` (positions in the model's parameter vector) the
+    function is f(t, x, p) instead, p being those parameters, with exact
+    derivatives in p as well. That is what CasADi's forward sensitivities
+    differentiate.
+    """
 
     ca = import_casadi()
     n = model.n_states
+
+    with_p = free_index is not None
+    free = [] if free_index is None else [int(i) for i in free_index]
+    k = len(free)
+
+    # Input sizes, in order: t, x and, with parameters, p.
+    sizes = (1, n, k) if with_p else (1, n)
+    n_inputs = len(sizes)
+
+    def full(arg):
+        """The model's parameter vector with the free entries from p."""
+        values = model.parameter_values.copy()
+
+        if with_p:
+            values[free] = np.ravel(arg[2].full())
+
+        return values
+
+    directions = np.eye(model.parameter_values.size)[free]
 
     class Jacobian(ca.Callback):
 
@@ -358,24 +713,32 @@ def _casadi_rhs(model, name):
             ca.Callback.__init__(self)
             self.construct(name, opts)
 
-        # Inputs: t, x, and the nominal output CasADi passes along.
+        # Inputs: the function's, and the nominal output CasADi passes along.
         def get_n_in(self):
-            return 3
+            return n_inputs + 1
 
+        # d(f)/d(each input).
         def get_n_out(self):
-            return 2
+            return n_inputs
 
         def get_sparsity_in(self, index):
-            return ca.Sparsity.dense((1, n, n)[index], 1)
+            return ca.Sparsity.dense((sizes + (n,))[index], 1)
 
         def get_sparsity_out(self, index):
-            return ca.Sparsity.dense(n, (1, n)[index])
+            return ca.Sparsity.dense(n, sizes[index])
 
         def eval(self, arg):
             time = float(arg[0])
             states = np.ravel(arg[1].full())
+            params = full(arg)
 
-            return [model.jac_time(time, states), model.jac(time, states)]
+            out = [model.jac_time(time, states, params),
+                   model.jac(time, states, params)]
+
+            if with_p:
+                out.append(model.jac_params(time, states, params)[:, free])
+
+            return out
 
     class Forward(ca.Callback):
         """Directional derivatives.
@@ -384,25 +747,37 @@ def _casadi_rhs(model, name):
         GMRES Newton scheme asks for -- are one JAX jvp each, far cheaper
         than forming the Jacobian. CasADi also builds the Jacobian for its
         direct solve out of forward directions, all n of them at once; that
-        request is the exact Jacobian times the seeds.
+        request is the exact Jacobian times the seeds. Forward sensitivities
+        ask for one direction per parameter, seeded in x and p together.
+
+        CasADi's forward sensitivities also differentiate this once more,
+        for the Newton matrix of the system they add. Only the iteration
+        uses that, not the converged values, so CasADi differences it
+        (enable_fd) rather than this building second derivatives.
         """
 
         def __init__(self, n_directions, name, opts):
             ca.Callback.__init__(self)
             self.n_directions = n_directions
-            self.construct(name, opts)
+            self.construct(name, dict(opts, enable_fd=with_p))
 
-        # Inputs: t, x, the nominal output, then the seeds for t and x.
+        # Inputs: the function's, the nominal output, then a seed for each
+        # of the function's inputs.
         def get_n_in(self):
-            return 5
+            return 2 * n_inputs + 1
 
         def get_n_out(self):
             return 1
 
         def get_sparsity_in(self, index):
-            k = self.n_directions
-            return ca.Sparsity.dense(*((1, 1), (n, 1), (n, 1), (1, k),
-                                       (n, k))[index])
+            if index < n_inputs:
+                return ca.Sparsity.dense(sizes[index], 1)
+
+            if index == n_inputs:
+                return ca.Sparsity.dense(n, 1)
+
+            return ca.Sparsity.dense(sizes[index - n_inputs - 1],
+                                     self.n_directions)
 
         def get_sparsity_out(self, index):
             return ca.Sparsity.dense(n, self.n_directions)
@@ -410,23 +785,33 @@ def _casadi_rhs(model, name):
         def eval(self, arg):
             time = float(arg[0])
             states = np.ravel(arg[1].full())
-            seed_time = np.ravel(arg[3].full())
-            seed_states = np.asarray(arg[4].full()).reshape(
-                n, self.n_directions)
+            params = full(arg)
 
-            by_time = (model.jac_time(time, states).ravel()
+            seeds = arg[n_inputs + 1:]
+            seed_time = np.ravel(seeds[0].full())
+            seed_states = np.asarray(seeds[1].full()).reshape(
+                n, self.n_directions)
+            seed_params = (np.asarray(seeds[2].full()).reshape(
+                k, self.n_directions) if with_p else None)
+
+            by_time = (model.jac_time(time, states, params).ravel()
                        if np.any(seed_time) else None)
 
-            if self.n_directions > max(1, n // 16):
-                out = model.jac(time, states) @ seed_states
+            if seed_params is not None and np.any(seed_params):
+                out = model.tangents(time, states, seed_states,
+                                     seed_params.T @ directions, params)
+
+            elif self.n_directions > max(1, n // 16):
+                out = model.jac(time, states, params) @ seed_states
+
             else:
                 out = np.zeros((n, self.n_directions))
 
-                for k in range(self.n_directions):
+                for column in range(self.n_directions):
 
-                    if np.any(seed_states[:, k]):
-                        out[:, k] = model.jvp(time, states,
-                                              seed_states[:, k])
+                    if np.any(seed_states[:, column]):
+                        out[:, column] = model.jvp(
+                            time, states, seed_states[:, column], params)
 
             if by_time is not None:
                 out = out + np.outer(by_time, seed_time)
@@ -440,25 +825,26 @@ def _casadi_rhs(model, name):
             self.construct(name, opts)
 
         def get_n_in(self):
-            return 2
+            return n_inputs
 
         def get_n_out(self):
             return 1
 
         def get_name_in(self, index):
-            return ("t", "x")[index]
+            return ("t", "x", "p")[index]
 
         def get_name_out(self, index):
             return "ode"
 
         def get_sparsity_in(self, index):
-            return ca.Sparsity.dense((1, n)[index], 1)
+            return ca.Sparsity.dense(sizes[index], 1)
 
         def get_sparsity_out(self, index):
             return ca.Sparsity.dense(n, 1)
 
         def eval(self, arg):
-            return [model.rhs(float(arg[0]), np.ravel(arg[1].full()))]
+            return [model.rhs(float(arg[0]), np.ravel(arg[1].full()),
+                              full(arg))]
 
         def has_jacobian(self):
             return True
@@ -642,7 +1028,84 @@ def _casadi_identity_transition(n_states):
 # Backends
 # ======================================================================
 
-class JaxBackend(ScipyBackend):
+class _CompiledModelCheck:
+    """
+    What every traced backend does before reusing its compiled model.
+
+    The compiled model is reused from solve to solve, which is what makes a
+    loop of short solves cheap. Two things keep it right:
+
+    - the declared parameters' values are read from their owners again, so
+      assigning parameters between solves needs no new trace, and
+    - the compiled right-hand side is checked against the unit's own
+      (TracedModel.matches). A number the trace froze in that has changed
+      since -- a kinetic constant changed with set_params without being
+      declared, a controller setting, a feed, the utility -- would otherwise
+      be silently ignored. When the check fails the model is traced again
+      at the unit's current state, with a warning; the unit is not reset.
+    """
+
+    parameters_are_inputs = True
+
+    def solve(self, unit, runtime=None, time_grid=None, eval_sens=False,
+              jac_v_prod=False, verbose=True, options=None, any_event=True,
+              parameters=None):
+
+        if not self.needs_compile(unit, eval_sens, jac_v_prod, parameters):
+            self.check_compiled_model(unit)
+
+        return super().solve(
+            unit, runtime=runtime, time_grid=time_grid, eval_sens=eval_sens,
+            jac_v_prod=jac_v_prod, verbose=verbose, options=options,
+            any_event=any_event, parameters=parameters)
+
+    def check_compiled_model(self, unit):
+
+        self.model.refresh_parameters()
+
+        time = float(unit.elapsed_time)
+        states = np.asarray(unit.create_solver_init_states(), dtype=float)
+
+        if self.model.matches(unit, time, states):
+            return
+
+        warnings.warn(
+            f"{type(unit).__name__}: a number its compiled model was built "
+            "with has changed -- a kinetic constant set with set_params, a "
+            "controller setting, a feed or the utility -- so the model is "
+            f"traced again at t={time:g}. Numbers changed between solves "
+            "need no new trace when they are declared: solve_unit("
+            "parameters=Parameters.kinetics(unit)), or Parameters().add(...) "
+            "for anything else.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+        self.retrace(unit, time, states)
+
+    def retrace(self, unit, time, states):
+        self.model = TracedModel(unit, time, states, self.parameters)
+        self.outputs = None
+
+    def output_tangents(self, unit):
+        """The output states' sensitivities, from the compiled replay
+        (TracedOutputs), built at the first point it is asked about."""
+
+        backend = self
+
+        def tangents(time, states, sens, params):
+
+            if backend.outputs is None:
+                backend.outputs = TracedOutputs(unit, time, states,
+                                                backend.parameters)
+
+            return backend.outputs.tangents(
+                time, states, sens, backend.parameters.free_index, params)
+
+        return tangents
+
+
+class JaxBackend(_CompiledModelCheck, ScipyBackend):
     """
     ScipyBackend on the JAX-compiled right-hand side.
 
@@ -673,14 +1136,18 @@ class JaxBackend(ScipyBackend):
 
         self.exact_jacobian = bool(exact_jacobian)
         self.model = None
+        self.outputs = None
 
     def compile_integrator(self, unit, eval_sens=False, jac_v_prod=False,
-                           options=None, verbose=True, any_event=True):
+                           options=None, verbose=True, any_event=True,
+                           parameters=None):
 
         states_init = super().compile_integrator(
-            unit, eval_sens, jac_v_prod, options, verbose, any_event)
+            unit, eval_sens, jac_v_prod, options, verbose, any_event,
+            parameters)
 
-        self.model = TracedModel(unit, unit.elapsed_time, states_init)
+        self.model = TracedModel(unit, unit.elapsed_time, states_init,
+                                 self.parameters)
 
         return states_init
 
@@ -697,7 +1164,7 @@ class JaxBackend(ScipyBackend):
         return translated
 
 
-class JaxAssimuloBackend(AssimuloBackend):
+class JaxAssimuloBackend(_CompiledModelCheck, AssimuloBackend):
     """
     AssimuloBackend (CVode) on the JAX-compiled right-hand side.
 
@@ -709,6 +1176,10 @@ class JaxAssimuloBackend(AssimuloBackend):
     (linear_solver_hint = "krylov"); that is followed from KRYLOV_MIN_STATES
     states up, and below that the exact dense Jacobian is the faster choice.
 
+    Sensitivities (eval_sens=True) are CVODES's forward sensitivities with
+    an exact right-hand side for them (TracedModel.sens_rhs), and the output
+    states' sensitivities come from the compiled replay (TracedOutputs).
+
     Events work exactly as under AssimuloBackend: they are evaluated on the
     unit itself.
 
@@ -716,7 +1187,8 @@ class JaxAssimuloBackend(AssimuloBackend):
     ----------
     exact_jacobian : bool, optional
         Hand CVode the exact derivatives. Default True. False keeps only the
-        compiled right-hand side.
+        compiled right-hand side, and leaves the sensitivities to CVODES's
+        difference quotients.
     """
 
     def __init__(self, options=None, exact_jacobian=True):
@@ -732,18 +1204,17 @@ class JaxAssimuloBackend(AssimuloBackend):
 
         self.exact_jacobian = bool(exact_jacobian)
         self.model = None
+        self.outputs = None
 
     def compile_integrator(self, unit, eval_sens=False, jac_v_prod=False,
-                           options=None, verbose=True, any_event=True):
+                           options=None, verbose=True, any_event=True,
+                           parameters=None):
 
-        if eval_sens:
-            raise NotImplementedError(
-                "JaxAssimuloBackend does not compute parameter "
-                "sensitivities yet. Use AssimuloBackend for them."
-            )
+        self.outputs = None
 
         states_init = super().compile_integrator(
-            unit, eval_sens, jac_v_prod, options, verbose, any_event)
+            unit, eval_sens, jac_v_prod, options, verbose, any_event,
+            parameters)
 
         if self.exact_jacobian:
             self._solver.usejac = True
@@ -764,38 +1235,74 @@ class JaxAssimuloBackend(AssimuloBackend):
 
     def set_ode_problem(self, unit, states_init):
 
-        self.model = TracedModel(unit, unit.elapsed_time, states_init)
-        model = self.model
+        self.model = TracedModel(unit, unit.elapsed_time, states_init,
+                                 self.parameters)
 
-        def rhs(time, states, sw=None):
-            return model.rhs(time, states)
-
+        # The callbacks look the model up on the backend at each call, so a
+        # model traced again (check_compiled_model) takes over in place.
+        backend = self
         events = unit.compiled_events
+        settings = {}
 
         if events:
-            problem = Explicit_Problem(rhs, states_init,
-                                       t0=unit.elapsed_time,
-                                       sw0=[True] * len(events))
-            attach_assimulo_events(problem, unit)
-        else:
-            problem = Explicit_Problem(rhs, states_init,
-                                       t0=unit.elapsed_time)
+            settings["sw0"] = [True] * len(events)
 
-        if self.exact_jacobian:
+        if self.eval_sens:
+            # CVode passes the parameters on: positionally as (t, y, p)
+            # without switches, by keyword (sw=, p=) with them; jacv always
+            # by keyword. They are the free entries of the full vector.
+            free = self.parameters.free_index
+            settings["p0"] = self.parameters.free_values()
+
+            def full(p):
+                values = backend.model.parameter_values.copy()
+
+                if p is not None:
+                    values[free] = p
+
+                return values
+
+            def rhs(time, states, p=None, sw=None):
+                return backend.model.rhs(time, states, full(p))
+
+            def jac(time, states, p=None, sw=None):
+                return backend.model.jac(time, states, full(p))
+
+            def jacv(time, states, rhs_value, vector, p=None, sw=None):
+                return backend.model.jvp(time, states, vector, full(p))
+
+            def rhs_sens(time, states, sens, p=None, sw=None):
+                return backend.model.sens_rhs(time, states, sens, free,
+                                              full(p))
+
+        else:
+            def rhs(time, states, sw=None):
+                return backend.model.rhs(time, states)
 
             def jac(time, states, sw=None):
-                return model.jac(time, states)
+                return backend.model.jac(time, states)
 
             def jacv(time, states, rhs_value, vector, sw=None):
-                return model.jvp(time, states, vector)
+                return backend.model.jvp(time, states, vector)
 
+        problem = Explicit_Problem(rhs, states_init, t0=unit.elapsed_time,
+                                   **settings)
+
+        if events:
+            attach_assimulo_events(problem, unit,
+                                   carry_sensitivities=self.eval_sens)
+
+        if self.exact_jacobian:
             problem.jac = jac
             problem.jacv = jacv
+
+            if self.eval_sens:
+                problem.rhs_sens = rhs_sens
 
         self._problem = problem
 
 
-class CasadiBackend(IntegratorBackend):
+class CasadiBackend(_CompiledModelCheck, IntegratorBackend):
     """
     CasADi's CVODES (or IDAS) on the JAX-compiled right-hand side.
 
@@ -821,12 +1328,16 @@ class CasadiBackend(IntegratorBackend):
     output time, and of the event functions, which are numeric and get
     differenced. CasADi 3.8 also marks the support experimental.
 
+    Sensitivities (eval_sens=True) are CasADi's: the free parameters become
+    the DAE's ``p``, and CasADi's forward sensitivities of the integrator
+    run on the Callback's exact derivatives in x and p.
+
     What it does not do, and refuses rather than fakes:
 
     - **Terminal events.** CasADi restarts at a crossing but this backend has
       no way yet to end the run there, so a unit with an event that ends the
       run is refused.
-    - **Sensitivities**, for now.
+    - **Sensitivities with algebraic states or located events**, for now.
 
     Parameters
     ----------
@@ -919,11 +1430,14 @@ class CasadiBackend(IntegratorBackend):
         return translated
 
     def compile_integrator(self, unit, eval_sens=False, jac_v_prod=False,
-                           options=None, verbose=True, any_event=True):
+                           options=None, verbose=True, any_event=True,
+                           parameters=None):
 
-        if eval_sens:
+        if eval_sens and (unit.has_algebraic_balance or self.locate_events):
             raise NotImplementedError(
-                "CasadiBackend does not compute sensitivities yet."
+                "CasadiBackend computes sensitivities for ODEs with events "
+                "stepped through (locate_events=False) only. Use "
+                "JaxAssimuloBackend."
             )
 
         self.check_algebraic_support(unit)
@@ -947,8 +1461,14 @@ class CasadiBackend(IntegratorBackend):
                                  dtype=float)
         unit.save_initial_solver_state(states_init, unit.elapsed_time)
 
-        self.model = TracedModel(unit, unit.elapsed_time, states_init)
-        self.function = self.model.casadi_function()
+        self.eval_sens = eval_sens
+        self.jac_v_prod = jac_v_prod
+        self.set_parameters(unit, parameters, eval_sens)
+
+        self.model = TracedModel(unit, unit.elapsed_time, states_init,
+                                 self.parameters)
+        self.outputs = None
+        self.function = self._casadi_function()
 
         unit.configure_solver()
 
@@ -956,12 +1476,26 @@ class CasadiBackend(IntegratorBackend):
 
         return states_init
 
-    def solve(self, unit, runtime=None, time_grid=None, eval_sens=False,
-              jac_v_prod=False, verbose=True, options=None, any_event=True):
+    def _casadi_function(self):
+        """f(t, x), or f(t, x, p) over the free parameters for sensitivities."""
 
-        if not self._compiled:
+        if self.eval_sens:
+            return self.model.casadi_function(
+                free_index=self.parameters.free_index)
+
+        return self.model.casadi_function()
+
+    def solve(self, unit, runtime=None, time_grid=None, eval_sens=False,
+              jac_v_prod=False, verbose=True, options=None, any_event=True,
+              parameters=None):
+
+        # The check _CompiledModelCheck.solve would make; this solve is
+        # CasADi's own, so it makes it here.
+        if self.needs_compile(unit, eval_sens, jac_v_prod, parameters):
             self.compile_integrator(unit, eval_sens, jac_v_prod, options,
-                                    verbose, any_event)
+                                    verbose, any_event, parameters)
+        else:
+            self.check_compiled_model(unit)
 
         unit.derivatives = np.array(
             unit.unit_model(time=unit.elapsed_time,
@@ -973,7 +1507,17 @@ class CasadiBackend(IntegratorBackend):
 
         unit.retrieve_results(time, states)
 
+        if self.eval_sens:
+            unit.retrieve_sensitivities(time, states, self._sensitivities,
+                                        self.parameters,
+                                        self.output_tangents(unit))
+
         return time, states
+
+    def retrace(self, unit, time, states):
+
+        super().retrace(unit, time, states)
+        self.function = self._casadi_function()
 
     def fast_solve(self, unit, runtime=None, time_grid=None, verbose=True):
 
@@ -1003,6 +1547,10 @@ class CasadiBackend(IntegratorBackend):
         if unit.has_algebraic_balance:
             return self._solve_dae(unit, states_init, start_time, grid, opts)
 
+        if self.eval_sens:
+            return self._solve_with_sensitivities(
+                states_init, start_time, grid, opts)
+
         t = ca.MX.sym("t")
         x = ca.MX.sym("x", states_init.size)
 
@@ -1027,6 +1575,44 @@ class CasadiBackend(IntegratorBackend):
         times = np.concatenate(([start_time], grid))
 
         return times, states
+
+    def _solve_with_sensitivities(self, states_init, start_time, grid, opts):
+        """
+        CVODES with the free parameters as p, and d(x)/d(p) at every output
+        time from CasADi's forward sensitivities (one direction per free
+        parameter, run on the Callback's exact forward derivatives).
+        """
+
+        ca = import_casadi()
+
+        free = self.parameters.free_index
+        n = states_init.size
+
+        t = ca.MX.sym("t")
+        x = ca.MX.sym("x", n)
+        p = ca.MX.sym("p", free.size)
+
+        integrator = ca.integrator(
+            "pharmapy", "cvodes",
+            {"t": t, "x": x, "p": p, "ode": self.function(t, x, p)},
+            start_time, list(grid), opts)
+
+        with_sensitivities = integrator.factory(
+            "pharmapy_sens", ["x0", "p"], ["xf", "jac:xf:p"])
+
+        values = self.model.parameter_values[free]
+        xf, jacobian = with_sensitivities(states_init, values)
+        self._stats = with_sensitivities.stats()
+
+        states = np.vstack((states_init[None, :], np.asarray(xf.full()).T))
+
+        # jac:xf:p is d vec(xf) / d p, vec stacking xf's columns (one per
+        # output time); at the start every sensitivity is zero.
+        sens = np.asarray(jacobian.full()).reshape(grid.size, n, free.size)
+        self._sensitivities = np.concatenate(
+            (np.zeros((1, n, free.size)), sens))
+
+        return np.concatenate(([start_time], grid)), states
 
     def _solve_dae(self, unit, states_init, start_time, grid, opts):
         """IDAS on the unit's differential and algebraic states."""

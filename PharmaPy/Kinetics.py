@@ -389,10 +389,11 @@ class RxnKinetics:
             if self.elem_flag:
                 # Reorganize rxn orders into a stoich_matrix-like structure
                 if self.fit_paramsf:
-                    self.params_f = np.zeros_like(self.stoich_matrix,
-                                                  dtype=np.float64)
-
-                    self.params_f[self.order_map] = params[self.num_paramsk:]
+                    # set_at, so a traced vector can be assigned too (see
+                    # PharmaPy.Parameters); numerically the same write.
+                    self.params_f = np.set_at(
+                        np.zeros_like(self.stoich_matrix, dtype=np.float64),
+                        self.order_map, params[self.num_paramsk:])
 
     def nomenclature(self, stoich_matrix, kvals):
 
@@ -818,7 +819,7 @@ class CrystKinetics:
             else:
                 self.name_params = (r'\log(k_{bp})', r'\log(E_{bp}/R)', 'b',
                                 r'\log(k_{bs})', r'\log(E_{bs}/R)', 's_1', 's_2',
-                                r'\log(k_{g})', r'\log(E_{g}/R)', 'g','alpha','beta'
+                                r'\log(k_{g})', r'\log(E_{g}/R)', 'g','alpha','beta',
                                 r'\log(k_{d})', r'\log(E_{d}/R)', 'd')
         else:
             if len(param_dict['growth']) == 3:
@@ -845,7 +846,10 @@ class CrystKinetics:
             params_complete = self.transform_params(params_in,
                                                     self.reformulate_kin)
         else:
-            param_lens = np.array([3, 4, 3, 3])
+            # The lengths concat_params concatenated, so this is its inverse:
+            # [3, 4, 3, 3], or [3, 4, 5, 3] with size-dependent growth.
+            param_lens = np.array([np.size(vals)
+                                   for vals in self.params.values()])
             split_idx = param_lens.cumsum()[:-1]
 
             params_in = np.split(params_in, split_idx)

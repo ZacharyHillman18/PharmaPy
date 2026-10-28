@@ -7,7 +7,8 @@ from PharmaPy.Commons import TerminateSimulation
 from PharmaPy.DataClasses import *
 
 
-def attach_assimulo_events(problem, unit, implicit=False):
+def attach_assimulo_events(problem, unit, implicit=False,
+                           carry_sensitivities=False):
     """
     Give an Assimulo problem the vessel's switching surfaces.
 
@@ -18,6 +19,13 @@ def attach_assimulo_events(problem, unit, implicit=False):
     The explicit and implicit problem classes disagree on the signature:
     Explicit_Problem asks for ``(t, y, sw)`` while Implicit_Problem asks for
     ``(t, y, yd, sw)``.
+
+    ``carry_sensitivities``: CVode restarts its sensitivities from
+    ``solver.yS0`` at every event, which is zero unless set. Without the
+    carry, every sensitivity silently starts again from zero after an event
+    (on a test problem, dy/dp = -0.297 where the exact value is -0.410). The
+    vessel's events mark corners where the right-hand side is continuous, so
+    the sensitivities do not jump there and are carried over unchanged.
     """
 
     if implicit:
@@ -35,11 +43,26 @@ def attach_assimulo_events(problem, unit, implicit=False):
             index for index, flag in enumerate(flags) if flag
         ]
 
+        if carry_sensitivities:
+            solver.yS0 = np.array([
+                solver.interpolate_sensitivity(solver.t, 0, index)
+                for index in range(len(solver.p))
+            ])
+
         if unit.handle_event(solver.t, triggered):
             raise TerminateSimulation
 
     problem.state_events = state_events
     problem.handle_event = handle_event
+
+
+def parameter_scales(values):
+    """Typical magnitudes of parameters, for CVODES's pbar: |p|, or 1 where
+    a parameter is zero."""
+
+    values = np.abs(np.asarray(values, dtype=float))
+
+    return np.where(values > 0, values, 1.0)
 
 
 class IntegratorBackend(ABC):
@@ -49,6 +72,72 @@ class IntegratorBackend(ABC):
 
         # Neutral linear-solver request, set by the unit operation.
         self.linear_solver = None
+
+        self.eval_sens = False
+        self.jac_v_prod = False
+
+        # The declared parameters the compiled problem was built for (see
+        # PharmaPy.Parameters), what identifies that declaration, and
+        # whether it was the default one (see declared_parameters).
+        self.parameters = None
+        self._parameter_signature = None
+        self._default_parameters = False
+
+    # Whether declared parameters are part of what gets compiled. A numeric
+    # backend reads every number from the unit as it runs, so a declaration
+    # only matters to it for sensitivities; a traced backend compiles them
+    # in as inputs.
+    parameters_are_inputs = False
+
+    def declared_parameters(self, unit, parameters, eval_sens):
+        """
+        The parameters a solve works with.
+
+        Sensitivities with nothing declared are taken with respect to every
+        kinetics object's parameters, as legacy eval_sens was. A default
+        already built for this unit is reused.
+        """
+
+        if parameters is not None:
+            return parameters
+
+        if not eval_sens:
+            return None
+
+        if self.parameters is not None and self._default_parameters:
+            return self.parameters
+
+        from PharmaPy.Parameters import Parameters
+
+        return Parameters.kinetics(unit)
+
+    def parameter_signature(self, parameters, eval_sens):
+        if parameters is None or not (eval_sens or self.parameters_are_inputs):
+            return None
+
+        return parameters.signature()
+
+    def needs_compile(self, unit, eval_sens=False, jac_v_prod=False,
+                      parameters=None):
+        """Whether a solve asked for this way has to compile first."""
+
+        if (not self._compiled or eval_sens != self.eval_sens
+                or jac_v_prod != self.jac_v_prod):
+            return True
+
+        declared = self.declared_parameters(unit, parameters, eval_sens)
+
+        return (self.parameter_signature(declared, eval_sens)
+                != self._parameter_signature)
+
+    def set_parameters(self, unit, parameters, eval_sens):
+        """Record the declaration a compile is for."""
+
+        self.parameters = self.declared_parameters(unit, parameters,
+                                                   eval_sens)
+        self._default_parameters = parameters is None and eval_sens
+        self._parameter_signature = self.parameter_signature(
+            self.parameters, eval_sens)
 
     # Backends that cannot integrate a differential-algebraic system set
     # this False, and refuse at compile time rather than silently treating a
@@ -117,6 +206,7 @@ class IntegratorBackend(ABC):
         options=None,
         verbose=True,
         any_event=True,
+        parameters=None,
     ):
         pass
 
@@ -131,7 +221,16 @@ class IntegratorBackend(ABC):
         verbose=True,
         options=None,
         any_event=True,
+        parameters=None,
     ):
+        """
+        Integrate the unit from where it stands.
+
+        ``parameters`` (PharmaPy.Parameters) declares numbers of the unit
+        that may change between solves; ``eval_sens`` asks for sensitivities
+        with respect to its free entries (every kinetics object's parameters
+        when nothing is declared), returned in ``unit.result.sensitivities``.
+        """
         pass
 
     def fast_solve(
@@ -174,6 +273,10 @@ class AssimuloBackend(IntegratorBackend):
         self.eval_sens = False
         self.jac_v_prod = False
 
+        # The free parameter values the unit was last given (see
+        # set_ode_problem).
+        self._assigned = None
+
     def set_linear_solver(self, kind):
 
         super().set_linear_solver(kind)
@@ -191,6 +294,7 @@ class AssimuloBackend(IntegratorBackend):
             options=None,
             verbose=True,
             any_event=True,
+            parameters=None,
     ):
 
         self.eval_sens = eval_sens
@@ -200,8 +304,10 @@ class AssimuloBackend(IntegratorBackend):
 
         states_init = unit.create_solver_init_states()
         unit.save_initial_solver_state(states_init,unit.elapsed_time)
-        
+
         self.check_algebraic_support(unit)
+
+        self.set_parameters(unit, parameters, eval_sens)
 
         self.set_ode_problem(unit,states_init)
 
@@ -234,6 +340,8 @@ class AssimuloBackend(IntegratorBackend):
 
         if not verbose:
             solver.verbosity = 50
+            # A long run otherwise prints "Integrator time: ..." as it goes.
+            solver.display_progress = False
 
 
         self._solver = solver
@@ -253,13 +361,10 @@ class AssimuloBackend(IntegratorBackend):
             verbose=True,
             options=None,
             any_event=True,
+            parameters=None,
     ):
 
-        if (
-            not self._compiled
-            or eval_sens != self.eval_sens
-            or jac_v_prod != self.jac_v_prod
-        ):
+        if self.needs_compile(unit, eval_sens, jac_v_prod, parameters):
 
             states_init = self.compile_integrator(
                 unit,
@@ -268,6 +373,7 @@ class AssimuloBackend(IntegratorBackend):
                 options,
                 verbose,
                 any_event,
+                parameters,
             )
 
             unit.derivatives = self._problem.rhs(
@@ -284,7 +390,35 @@ class AssimuloBackend(IntegratorBackend):
 
         unit.retrieve_results(time,states)
 
+        if self.eval_sens:
+            unit.retrieve_sensitivities(
+                time, states, self.sensitivities(time), self.parameters,
+                self.output_tangents(unit))
+
         return time, states
+
+    def sensitivities(self, time):
+        """
+        CVODES's forward sensitivities of the last solve, as
+        (time, solver state, free parameter).
+
+        At the start of the solve they are zero by definition; CVODES reports
+        them as NaN there, which legacy PharmaPy also overwrote with zeros.
+        """
+
+        sens = np.moveaxis(np.asarray(self._solver.p_sol, dtype=float), 0, -1)
+
+        time = np.asarray(time, dtype=float)
+        sens[time == time[0]] = 0.0
+
+        return sens
+
+    def output_tangents(self, unit):
+        """How output states move along the sensitivities, or None for the
+        unit's own difference quotients."""
+
+        return None
+
     def fast_solve(
             self,
             unit,
@@ -310,19 +444,45 @@ class AssimuloBackend(IntegratorBackend):
         self._solver.t = unit.elapsed_time
         self._solver.y = states_init
 
+        if not self.eval_sens:
+            self._solver.initialize()
+
+            return self._solver.simulate(
+                final_time,
+                ncp_list=time_grid,
+            )
+
+        # The parameter values CVODES differentiates at are its own copy,
+        # set here from the owners, and each sensitivity starts at zero:
+        # the derivative of this solve's trajectory with its start fixed.
+        nominal = self.parameters.values()
+
+        self._solver.p = nominal[self.parameters.free]
+        self._solver.pbar = parameter_scales(self._solver.p)
+        self._solver.yS0 = np.zeros((int(self.parameters.free.sum()),
+                                     np.size(states_init)))
+        self._assigned = None
+
         self._solver.initialize()
 
-        return self._solver.simulate(
-            final_time,
-            ncp_list=time_grid,
-        )
+        try:
+            return self._solver.simulate(
+                final_time,
+                ncp_list=time_grid,
+            )
+        finally:
+            # CVODES's difference quotients evaluate the model at perturbed
+            # parameters; the replay that follows has to see the nominal ones.
+            self.parameters.assign(nominal)
+            self._assigned = None
+
     def set_ode_problem(
             self,
             unit,
             states_init,
     ):
 
-        def model(time, states, sw=None):
+        def evaluate(time, states):
             rhs = unit.unit_model(time=time, states=states)
 
             if len(rhs) != len(states):
@@ -334,73 +494,45 @@ class AssimuloBackend(IntegratorBackend):
             return rhs
 
         events = unit.compiled_events
+        settings = {}
 
         if events:
-            problem = Explicit_Problem(
-                model,
-                states_init,
-                t0=unit.elapsed_time,
-                sw0=[True] * len(events),
-            )
+            settings["sw0"] = [True] * len(events)
 
-            attach_assimulo_events(problem, unit)
+        if self.eval_sens:
+            # With parameters (p0), CVode passes them on: positionally as
+            # (t, y, p) without switches, by keyword as (t, y, sw=, p=) with
+            # them. CVODES forms the sensitivity right-hand side by
+            # difference quotients, calling this at perturbed p, which is
+            # why the unit is given p whenever it changes.
+            parameters = self.parameters
+            settings["p0"] = parameters.free_values()
+
+            def model(time, states, p=None, sw=None):
+                if p is not None and (self._assigned is None
+                                      or not np.array_equal(p, self._assigned)):
+                    parameters.assign_free(p)
+                    self._assigned = np.array(p, dtype=float)
+
+                return evaluate(time, states)
 
         else:
-            problem = Explicit_Problem(
-                model,
-                states_init,
-                t0=unit.elapsed_time
-            )
+            def model(time, states, sw=None):
+                return evaluate(time, states)
+
+        problem = Explicit_Problem(
+            model,
+            states_init,
+            t0=unit.elapsed_time,
+            **settings,
+        )
+
+        if events:
+            attach_assimulo_events(problem, unit,
+                                   carry_sensitivities=self.eval_sens)
 
         self._problem = problem
 
-    def unit_jacobian(self, t, y):
-        return self.jac_states_fun(t, y)
-
-    def jac_states_numerical(self, time, states, params, return_only=True):
-        #TODO check if necessary
-        if return_only:
-            return self.jac_states_vals
-        else:
-            def wrap_states(st): return self.unit_model(time, st, params)
-
-            abstol = self.sundials_opt['atol']
-            reltol = self.sundials_opt['rtol']
-            jac_states = numerical_jac_central(wrap_states, states,
-                                               dx=dx_jac_x,
-                                               abs_tol=abstol, rel_tol=reltol)
-
-            return jac_states
-
-    def jac_params_numerical(self, time, states, params):
-        #TODO check if necessary
-        def wrap_params(theta): return self.unit_model(time, states, theta)
-
-        abstol = self.sundials_opt['atol']
-        reltol = self.sundials_opt['rtol']
-        p_bar = self.sundials_opt['pbar']
-
-        dp = np.abs(p_bar) * np.sqrt(max(reltol, eps))
-
-        jac_params = numerical_jac_central(wrap_params, params,
-                                           dx=dp,
-                                           abs_tol=abstol, rel_tol=reltol)
-
-        return jac_params
-    
-    def rhs_sensitivity(self, time, states, sens, params):
-
-        jac_params_vals = self.jac_params_fn(time, states, params)
-
-        jac_states_vals = self.jac_states_fn(time, states, params,
-                                             return_only=False)
-
-        rhs_sens = np.dot(jac_states_vals, sens) + jac_params_vals
-
-        self.jac_states_vals = jac_states_vals
-
-        return rhs_sens
-    
 
 class AssimuloDAEBackend(IntegratorBackend):
     """
@@ -497,6 +629,7 @@ class AssimuloDAEBackend(IntegratorBackend):
             options=None,
             verbose=True,
             any_event=True,
+            parameters=None,
     ):
 
         if eval_sens:
@@ -567,6 +700,7 @@ class AssimuloDAEBackend(IntegratorBackend):
             verbose=True,
             options=None,
             any_event=True,
+            parameters=None,
     ):
 
         if (
@@ -963,6 +1097,7 @@ class DiffeqpyBackend(IntegratorBackend):
             options=None,
             verbose=True,
             any_event=True,
+            parameters=None,
     ):
 
         if eval_sens:
@@ -1004,6 +1139,7 @@ class DiffeqpyBackend(IntegratorBackend):
             verbose=True,
             options=None,
             any_event=True,
+            parameters=None,
     ):
 
         if (
@@ -1594,7 +1730,8 @@ class ScipyBackend(IntegratorBackend):
     # ------------------------------------------------------------------
 
     def compile_integrator(self, unit, eval_sens=False, jac_v_prod=False,
-                           options=None, verbose=True, any_event=True):
+                           options=None, verbose=True, any_event=True,
+                           parameters=None):
 
         if eval_sens:
             raise NotImplementedError(
@@ -1614,6 +1751,8 @@ class ScipyBackend(IntegratorBackend):
         states_init = unit.create_solver_init_states()
         unit.save_initial_solver_state(states_init, unit.elapsed_time)
 
+        self.set_parameters(unit, parameters, eval_sens)
+
         if options:
             self.options.update(options)
 
@@ -1629,13 +1768,10 @@ class ScipyBackend(IntegratorBackend):
         return states_init
 
     def solve(self, unit, runtime=None, time_grid=None, eval_sens=False,
-              jac_v_prod=False, verbose=True, options=None, any_event=True):
+              jac_v_prod=False, verbose=True, options=None, any_event=True,
+              parameters=None):
 
-        if (
-            not self._compiled
-            or eval_sens != self.eval_sens
-            or jac_v_prod != self.jac_v_prod
-        ):
+        if self.needs_compile(unit, eval_sens, jac_v_prod, parameters):
 
             states_init = self.compile_integrator(
                 unit,
@@ -1644,6 +1780,7 @@ class ScipyBackend(IntegratorBackend):
                 options,
                 verbose,
                 any_event,
+                parameters,
             )
 
             unit.derivatives = np.array(

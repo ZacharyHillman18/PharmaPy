@@ -3333,7 +3333,106 @@ class MultiPhaseVessel():
                     solver_history,
                     output_history)
         return self.result
-    
+
+    def retrieve_sensitivities(self, time, solver_states, sensitivities,
+                               parameters, output_tangents=None):
+        """
+        Add the solve's sensitivities to the result.
+
+        ``result.sensitivities[field]`` is d(result.field)/d(free parameter)
+        along the solve, shaped like the field with one more axis for the
+        parameters: (time, parameter) for a scalar field, (time, dim,
+        parameter) for a vector one. Fields are every solver state and every
+        output state, named as in the result; ``result.param_names`` names
+        the parameters.
+
+        ``sensitivities`` is (time, solver state, free parameter), from the
+        integrator. An output state h moves with the parameters as
+        dh/dy S + dh/dp; ``output_tangents(time, states, S, params)`` returns
+        that as {StateKey: (*shape, free parameter)}. Without it, central
+        differences along each column of S are taken on a copy of the unit.
+        """
+
+        time = np.asarray(time, dtype=float).reshape(-1)
+        solver_states = np.asarray(solver_states, dtype=float).reshape(
+            time.size, -1)
+        sensitivities = np.asarray(sensitivities, dtype=float).reshape(
+            time.size, solver_states.shape[1], -1)
+
+        collection = self.solver_state_collection
+        fields = {}
+
+        for key, state_slice, state in zip(collection.keys,
+                                           collection.slices.values(),
+                                           collection.state_values):
+            values = sensitivities[:, state_slice, :]
+
+            if state.dim == 1:
+                values = values[:, 0, :]
+
+            fields[collection.format_key(key)] = values
+
+        if output_tangents is None:
+            output_tangents = self.output_tangents_by_differences(parameters)
+
+        params = parameters.values()
+        rows = [output_tangents(t, y, s, params)
+                for t, y, s in zip(time, solver_states, sensitivities)]
+
+        for key in rows[0]:
+            fields[self.output_state_collection.format_key(key)] = np.stack(
+                [row[key] for row in rows])
+
+        self.result.sensitivities = fields
+        self.result.param_names = parameters.free_names
+
+        return fields
+
+    def output_tangents_by_differences(self, parameters):
+        """
+        How the output states move along sensitivity directions, by central
+        differences on a copy of the unit (see retrieve_sensitivities).
+
+        Along column k of S the solver states move by S[:, k] for a unit
+        change in free parameter k, so one central difference with the
+        states and that parameter stepped together gives dh/dy S_k + dh/dp_k.
+        """
+
+        memo = {}
+        pseudo = self.create_pseudo(memo)
+        bound = parameters.bind(memo)
+        unpack = pseudo.solver_state_collection.unpack
+        free = parameters.free_index
+
+        def evaluate(time, states, params):
+            bound.assign(params)
+            pseudo.invalidate_inlet_cache()
+            return pseudo.output_states_at(time, unpack(states))
+
+        def tangents(time, states, sens, params):
+            columns = {}
+
+            for column, index in enumerate(free):
+                step = 1e-6 * max(abs(params[index]), 1e-3)
+
+                up = np.array(params, dtype=float)
+                down = np.array(params, dtype=float)
+                up[index] += step
+                down[index] -= step
+
+                high = evaluate(time, states + step * sens[:, column], up)
+                low = evaluate(time, states - step * sens[:, column], down)
+
+                for key in high:
+                    columns.setdefault(key, []).append(
+                        (np.asarray(high[key], dtype=float)
+                         - np.asarray(low[key], dtype=float)) / (2 * step))
+
+            return {key: np.stack(values, axis=-1)
+                    for key, values in columns.items()}
+
+        return tangents
+
 
     def build_dynamic_result(
         self,
