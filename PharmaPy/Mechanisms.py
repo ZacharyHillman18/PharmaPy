@@ -1330,6 +1330,36 @@ class PopulationBalanceMechanism(CrossPhaseTransferMechanism):
         return {key: -(net_vol_flow / vol_slurry) * state}
 
 
+def van_leer_limiter(theta):
+    """phi(theta) = (theta + |theta|) / (1 + |theta|).
+
+    Second order and TVD, but |theta| puts a kink at theta = 0: the limited
+    slope's derivative jumps where neighbouring differences change sign (the
+    peak of a distribution, the edge of its support).
+    """
+    return (np.abs(theta) + theta) / (1 + np.abs(theta))
+
+
+def van_albada_limiter(theta):
+    """phi(theta) = (theta**2 + theta) / (theta**2 + 1).
+
+    Second order like van Leer, and smooth everywhere: the limited slope
+    phi(a/b) * b = (a**2 b + a b**2) / (a**2 + b**2) is a rational function
+    of the neighbouring differences a, b, with no kink at a sign change. That
+    is what derivative-based estimation wants from the right-hand side. The
+    price is that it is not strictly TVD: for -1 < theta < 0 phi dips to
+    -0.21, where van Leer is zero, so a small overshoot is possible at an
+    extremum.
+    """
+    return (theta ** 2 + theta) / (theta ** 2 + 1)
+
+
+FLUX_LIMITERS = {
+    "van_leer": van_leer_limiter,
+    "van_albada": van_albada_limiter,
+}
+
+
 class OneDFVMMechanism(PopulationBalanceMechanism):
 
     def __init__(
@@ -1348,12 +1378,20 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         distrib_basis="intensive",
         vol_slurry=None,
         basis_mass=None,
+        limiter="van_leer",
     ):
         """
         Assumes an x_grid of constant dx
 
         Parameters
         ----------
+        limiter : str, optional
+            Flux limiter of the second-order upwind reconstruction, a key of
+            FLUX_LIMITERS: ``'van_leer'`` (default) or ``'van_albada'``, the
+            smooth one (see van_albada_limiter). Fixed at construction: a
+            compiled model freezes it, and at an empty start state the two
+            give the same right-hand side, so a change after compiling would
+            go unnoticed.
         distrib_basis : str, optional
             What ``distrib_init`` is expressed in. ``'intensive'``, the
             default and this stack's storage convention, is a number density
@@ -1390,6 +1428,11 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         if np.any(np.diff(self.x_grid) <= 0):
             raise ValueError(
                 'The size grid must be strictly increasing.')
+
+        if limiter not in FLUX_LIMITERS:
+            raise ValueError(
+                f"limiter={limiter!r} is not one of {sorted(FLUX_LIMITERS)}.")
+        self.limiter = limiter
 
         self.x_grid_sq = self.x_grid**2
         self.x_grid_cu = self.x_grid**3
@@ -1882,10 +1925,10 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         else:
             theta = (f_diff[1:]/ (f_diff[:-1] + eps * 10))
 
-        #Van-Leer limiter
+        # Flux limiter (van Leer unless the mechanism was built otherwise)
         limiter = np.zeros_like(f_diff)
         limiter = np.set_at(limiter, slice(None, -1),
-                            (np.abs(theta) + theta) / (1 + np.abs(theta)))
+                            FLUX_LIMITERS[self.limiter](theta))
         self._timers['pop_balance_compute_limiter'] = self._timers.get('pop_balance_compute_limiter',0)+perf_counter()-t0
 
         # t0 = perf_counter()
