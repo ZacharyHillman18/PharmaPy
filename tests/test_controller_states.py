@@ -69,8 +69,10 @@ GRID = np.linspace(0.0, RUN, 31)  # [s]
 
 def _reactor(controller, integrator=None, fed=True, utility=False,
              delta_hrxn=None):
+    # ScipyBackend by default, so the controllers are tested without
+    # Assimulo; the tests that need IDA say so and skip without it.
     unit = ContinuousReactor(
-        integrator=integrator or AssimuloBackend(options={'maxh': 60}),
+        integrator=integrator or ScipyBackend(options={'maxh': 60}),
         controller=controller, h_conv=H_CONV, diam=DIAMETER)
     unit.Phases = LiquidPhase(DATA_PATH, temp=TEMP, mole_conc=CONC_INIT,
                               vol=VOLUME, name_solv='solvent')

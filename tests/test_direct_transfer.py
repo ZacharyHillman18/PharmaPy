@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from PharmaPy.DataClasses import PhaseConnection, PhaseRef, StateKey
-from PharmaPy.IntegratorBackends import AssimuloBackend
+from PharmaPy.IntegratorBackends import ScipyBackend
 from PharmaPy.Mechanisms import DirectTransfer
 from PharmaPy.Phases_Refactored import LiquidPhase
 from PharmaPy.Reactors_Refactored import BatchReactor
@@ -41,7 +41,7 @@ SOURCE, SINK = PhaseRef('liquid', 0), PhaseRef('liquid', 1)
 
 def _vessel(mechanism, integrator=None, isothermal=True, weights=None):
     unit = BatchReactor(
-        integrator=integrator or AssimuloBackend(options=dict(TIGHT)),
+        integrator=integrator or ScipyBackend(options=dict(TIGHT)),
         isothermal=isothermal, h_conv=1000.0, diam=0.1)
     unit.Phases = [
         LiquidPhase(DATA_PATH, temp=TEMP, mass_frac=FRAC_0, mass=MASS_0,

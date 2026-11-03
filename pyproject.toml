@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # "PharmaPy" is taken on PyPI by an unrelated project, so the distribution is
 # published as pharmapy-org. The import name is unchanged: `import PharmaPy`.
 name = "pharmapy-org"
-version = "0.3.1"
+version = "0.3.2"
 description = "A Pythonic framework for the digital analysis of pharmaceutical manufacturing processes."
 readme = "README.md"
 requires-python = ">=3.9"

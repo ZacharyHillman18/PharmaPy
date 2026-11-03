@@ -16,7 +16,8 @@ What is pinned here:
   by the traced backends. Now the compiled model is checked before reuse,
   traced again with a warning, and the answer is right.
 
-Everything that needs JAX skips without it.
+Everything that needs JAX skips without it, and the JaxAssimuloBackend cases
+without Assimulo. The reference answers are ScipyBackend solves.
 """
 
 import warnings
@@ -24,7 +25,7 @@ import warnings
 import numpy as np
 import pytest
 
-from PharmaPy.IntegratorBackends import AssimuloBackend
+from PharmaPy.IntegratorBackends import AssimuloBackend, ScipyBackend
 from PharmaPy.Kinetics import CrystKinetics, RxnKinetics
 from PharmaPy.Parameters import Parameters, find_kinetics
 from PharmaPy.Phases_Refactored import LiquidPhase
@@ -241,16 +242,15 @@ def _traced_backend(name):
         return CasadiBackend(options={'maxh': 60})
 
     if name == "jax_cvode":
+        pytest.importorskip("assimulo")
         return JaxAssimuloBackend(options={'maxh': 60})
 
     return JaxBackend(options={'maxh': 60})
 
 
 def _truth(scale=FASTER, **controller):
-    """AssimuloBackend's answer with the kinetic constants scaled."""
-    pytest.importorskip("assimulo")
-
-    unit = _reactor(integrator=AssimuloBackend(options={'maxh': 60}))
+    """The numeric answer (ScipyBackend) with the kinetic constants scaled."""
+    unit = _reactor(integrator=ScipyBackend(options={'maxh': 60}))
     parameters = Parameters.kinetics(unit)
     parameters.assign(parameters.values() * scale)
 
@@ -322,20 +322,17 @@ def _set_point_run(integrator, declare):
 
 
 def _set_point_truth():
-    pytest.importorskip("assimulo")
-
-    truth, _ = _set_point_run(AssimuloBackend(options={'maxh': 60}), False)
+    truth, _ = _set_point_run(ScipyBackend(options={'maxh': 60}), False)
     truth.solve_unit(runtime=1800.0, verbose=False)
 
     return np.asarray(truth.result.vessel_vol)[-1]
 
 
-def test_a_controller_setting_changed_between_solves_is_seen(jax):
+@pytest.mark.parametrize("backend", ["jax", "jax_cvode"])
+def test_a_controller_setting_changed_between_solves_is_seen(jax, backend):
     """Not only kinetics: here the volume set point of a continuous
     reactor, changed part-way without a reset."""
-    from PharmaPy.TracedBackends import JaxAssimuloBackend
-
-    unit, _ = _set_point_run(JaxAssimuloBackend(options={'maxh': 60}), False)
+    unit, _ = _set_point_run(_traced_backend(backend), False)
 
     with pytest.warns(RuntimeWarning, match="traced again"):
         unit.solve_unit(runtime=1800.0, verbose=False)
@@ -345,11 +342,9 @@ def test_a_controller_setting_changed_between_solves_is_seen(jax):
                     _set_point_truth()) < 1e-4
 
 
-def test_a_declared_controller_setting_needs_no_new_trace(jax):
-    from PharmaPy.TracedBackends import JaxAssimuloBackend
-
-    unit, parameters = _set_point_run(
-        JaxAssimuloBackend(options={'maxh': 60}), True)
+@pytest.mark.parametrize("backend", ["jax", "jax_cvode"])
+def test_a_declared_controller_setting_needs_no_new_trace(jax, backend):
+    unit, parameters = _set_point_run(_traced_backend(backend), True)
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -361,10 +356,9 @@ def test_a_declared_controller_setting_needs_no_new_trace(jax):
                     _set_point_truth()) < 1e-4
 
 
-def test_a_changed_declaration_compiles_again(jax):
-    from PharmaPy.TracedBackends import JaxAssimuloBackend
-
-    unit = _reactor(integrator=JaxAssimuloBackend(options={'maxh': 60}))
+@pytest.mark.parametrize("backend", ["jax", "jax_cvode"])
+def test_a_changed_declaration_compiles_again(jax, backend):
+    unit = _reactor(integrator=_traced_backend(backend))
     parameters = Parameters.kinetics(unit)
 
     unit.solve_unit(time_grid=GRID, verbose=False, parameters=parameters)

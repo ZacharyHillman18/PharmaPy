@@ -220,6 +220,7 @@ def _sensitivity_backend(name, tolerance):
         pytest.importorskip("casadi")
         return CasadiBackend(options=options)
 
+    pytest.importorskip("assimulo")
     return JaxAssimuloBackend(options=options)
 
 
@@ -272,6 +273,7 @@ def test_casadi_and_cvode_sensitivities_agree(jax):
 
 
 def test_new_parameters_between_sensitivity_solves_need_no_new_trace(jax):
+    pytest.importorskip("assimulo")
     from PharmaPy.TracedBackends import JaxAssimuloBackend
 
     def build(integrator):
@@ -301,6 +303,8 @@ def test_new_parameters_between_sensitivity_solves_need_no_new_trace(jax):
 
 
 def test_a_concurrent_vessel_gives_each_member_its_sensitivities(jax):
+    # JaxAssimuloBackend, checked against differences of CVode solves.
+    pytest.importorskip("assimulo")
     from PharmaPy.TracedBackends import JaxAssimuloBackend
 
     def build(integrator):

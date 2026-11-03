@@ -21,7 +21,7 @@ import os
 import numpy as np
 import pytest
 
-from PharmaPy.IntegratorBackends import AssimuloBackend
+from PharmaPy.IntegratorBackends import AssimuloBackend, ScipyBackend
 from PharmaPy.Kinetics import RxnKinetics
 from PharmaPy.ParamEstim_Refactored import Experiment, ParameterEstimation
 from PharmaPy.Parameters import Parameters
@@ -100,8 +100,9 @@ def test_measurements_are_stacked_column_by_column():
 
 
 def test_every_experiment_has_to_declare_the_same_parameters():
-    reactor = _reactor(integrator=AssimuloBackend(options={}))
-    crystallizer = _crystallizer("batch", integrator=AssimuloBackend())
+    # Refused before anything is solved, so the backend does not matter.
+    reactor = _reactor(integrator=ScipyBackend(options={}))
+    crystallizer = _crystallizer("batch", integrator=ScipyBackend())
 
     experiments = [Experiment(reactor, REACTOR_GRID, np.zeros((13, 1)),
                               ('vessel_vol', None)),
@@ -143,6 +144,7 @@ def test_crystal_growth_is_recovered(jax):
     """Growth rate constant and order of the FVM batch crystallizer, from
     the dissolved solute (a solver state) and the third moment (an output
     state)."""
+    pytest.importorskip("assimulo")
     from PharmaPy.TracedBackends import JaxAssimuloBackend
 
     scale = np.ones(13)
@@ -200,6 +202,11 @@ def _ziegler_experiments(integrator):
 
 
 def test_ziegler_matches_legacy_parameter_estimation(jax):
+    pytest.importorskip("assimulo")
+
+    if not os.path.isdir(ZIEGLER):
+        pytest.skip("workshop_data/Case_study_1 is in the repository only")
+
     from PharmaPy.TracedBackends import JaxAssimuloBackend
 
     estimation = ParameterEstimation(_ziegler_experiments(
