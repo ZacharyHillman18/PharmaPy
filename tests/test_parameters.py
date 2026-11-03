@@ -25,19 +25,22 @@ import warnings
 import numpy as np
 import pytest
 
+from PharmaPy.Crystallizers_Refactored import BatchCrystallizer
 from PharmaPy.IntegratorBackends import AssimuloBackend, ScipyBackend
 from PharmaPy.Kinetics import CrystKinetics, RxnKinetics
 from PharmaPy.Parameters import Parameters, find_kinetics
 from PharmaPy.Phases_Refactored import LiquidPhase
-from PharmaPy.ProcessControl_Refactored import ContinuousVesselController
+from PharmaPy.ProcessControl_Refactored import (ContinuousVesselController,
+                                                SimpleTemperatureController)
 from PharmaPy.Reactors_Refactored import ContinuousReactor
 from PharmaPy.Streams_Refactored import LiquidStream
 
-from test_traced_backends import (CONC_RXN, DATA_PATH, DIAMETER, DISSOL,
-                                  EA_VALS, FEED_RXN, FEED_VOLFLOW, GROWTH,
-                                  H_CONV, K_VALS, PRIM, RXNS, SEC, SOLUB,
-                                  TEMP_RXN, VOLUME, _crystallizer, _max_rel,
-                                  _numeric_rhs, _pair, _reactor, _start)
+from test_traced_backends import (CONC_C, CONC_RXN, DATA_PATH, DIAMETER,
+                                  DISSOL, EA_VALS, FEED_RXN, FEED_VOLFLOW,
+                                  GROWTH, H_CONV, K_VALS, PRIM, RXNS, SEC,
+                                  SOLUB, TEMP_RXN, TEMP_START, VOLUME,
+                                  _crystallizer, _max_rel, _numeric_rhs,
+                                  _pair, _reactor, _solid, _start, cooling)
 
 pytestmark = pytest.mark.unit
 
@@ -110,6 +113,59 @@ def test_size_dependent_growth_round_trips():
     kinetics.set_params(values * 2)
     assert np.allclose(kinetics.concat_params(), values * 2)
     assert np.allclose(kinetics.params['dissolution'], np.array(DISSOL) * 2)
+
+
+def _size_dependent_crystallizer(beta):
+    """The FVM batch crystallizer with growth (1 + beta*x)**1."""
+    unit = BatchCrystallizer(
+        h_conv=H_CONV, diam=DIAMETER,
+        controller=SimpleTemperatureController(temp_func=cooling))
+    unit.Phases = [LiquidPhase(DATA_PATH, temp=TEMP_START, mass_conc=CONC_C,
+                               vol=VOLUME, name_solv='solvent'),
+                   _solid("fvm")]
+    unit.CrystKinetics = CrystKinetics(SOLUB, nucl_prim=PRIM, nucl_sec=SEC,
+                                       growth=GROWTH + (1.0, beta),
+                                       dissolution=DISSOL)
+    return unit
+
+
+def _with_crystals(unit, states):
+    """The start state with a population, so growth has something to act
+    on (at the start the distribution is empty and beta changes nothing).
+
+    Small enough that growth would not drain the solute within the
+    vessel's positivity horizon: a larger one is throttled to zero rates,
+    which hides beta as surely as the bug did.
+    """
+    collection = unit.solver_state_collection
+    distrib = collection.slices[next(key for key in collection.keys
+                                     if key.name == "distrib")]
+    states = states.copy()
+    states[distrib] = 1e6 * np.exp(-np.arange(distrib.stop - distrib.start)
+                                   / 5.0)  # [#/(um m**3)]
+    return states
+
+
+def test_assigned_size_dependent_growth_reaches_the_population_balance():
+    """(1 + beta*x)**alpha was cached when the kinetics were attached, so
+    assigning alpha or beta afterwards changed nothing."""
+    unit = _size_dependent_crystallizer(beta=0.2)
+    time, states = _start(unit)
+    states = _with_crystals(unit, states)
+    before = _numeric_rhs(unit, time, states)
+
+    parameters = Parameters.kinetics(unit)
+    moved = parameters.values()
+    moved[parameters.names.index('beta')] = 0.5
+    parameters.assign(moved)
+
+    built = _size_dependent_crystallizer(beta=0.5)
+    _start(built)
+
+    assigned = _numeric_rhs(unit, time, states)
+
+    assert _max_rel(assigned, _numeric_rhs(built, time, states)) < 1e-12
+    assert _max_rel(assigned, before) > 1e-3
 
 
 def test_a_concurrent_vessel_declares_each_member():
@@ -231,6 +287,41 @@ def test_exact_parameter_jacobian_matches_central_differences(jax):
                                   - model.rhs(time, states, down)) / (2 * step)
 
     assert _max_rel(exact, differences) < 1e-7
+
+
+def test_size_dependent_growth_is_an_input_of_the_compiled_model(jax):
+    """beta reaches the trace: new values need no new trace, and d/dbeta is
+    exact rather than the zero of a constant frozen in."""
+    from PharmaPy.TracedBackends import TracedModel
+
+    unit = _size_dependent_crystallizer(beta=0.2)
+    time, states = _start(unit)
+    states = _with_crystals(unit, states)
+    parameters = Parameters.kinetics(unit)
+    values = parameters.values()
+    beta = parameters.names.index('beta')
+
+    model = TracedModel(unit, time, states, parameters)
+
+    moved = values.copy()
+    moved[beta] = 0.5
+    parameters.assign(moved)
+    model.refresh_parameters()
+
+    assert _max_rel(model.rhs(time, states),
+                    _numeric_rhs(unit, time, states)) < 1e-12
+
+    exact = model.jac_params(time, states)[:, beta]
+    step = 1e-6 * moved[beta]
+    up, down = moved.copy(), moved.copy()
+    up[beta] += step
+    down[beta] -= step
+    differences = (model.rhs(time, states, up)
+                   - model.rhs(time, states, down)) / (2 * step)
+
+    assert np.max(np.abs(exact)) > 0
+    assert _max_rel(exact, differences) < 1e-6
+    assert model.traces == 1
 
 
 def _traced_backend(name):

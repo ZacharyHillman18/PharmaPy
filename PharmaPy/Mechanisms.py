@@ -1671,12 +1671,18 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         )
 
         self.set_third_moment(target_m3)
-    @PopulationBalanceMechanism.mechanism_kinetics.setter
-    def mechanism_kinetics(self,value):
-        if value is not None:
-            self._mechanism_kinetics = value
-            if len(value.params['growth'])>3:
-                self._growth_size_factor = (1 + value.params['growth'][4] * self.x_grid) ** value.params['growth'][3]
+
+    def growth_size_factor(self, growth_params):
+        """(1 + beta*x)**alpha of size-dependent growth, on the size grid.
+
+        Evaluated from the kinetics' parameters as they are now. It used to
+        be cached when the kinetics were attached, which froze alpha and
+        beta: set_params (and so Parameters.assign) never reached them, a
+        traced model held them as constants with zero sensitivity, and
+        kinetics given to the constructor never set the cache at all.
+        """
+        return (1 + growth_params[4] * self.x_grid) ** growth_params[3]
+
     def set_third_moment(self, target_m3):
         """Rescale the distribution to a given third moment, keeping its shape.
 
@@ -1894,7 +1900,7 @@ class OneDFVMMechanism(PopulationBalanceMechanism):
         else:
 
             t0 = perf_counter()
-            growth_dep = (growth* self._growth_size_factor)
+            growth_dep = growth * self.growth_size_factor(gparams)
             self._timers['pop_balance_compute_growth_dep'] = self._timers.get('pop_balance_compute_growth_dep',0)+perf_counter()-t0
             t0 = perf_counter()
             growth_pad = np.append(growth_dep,growth_dep[-1],)
