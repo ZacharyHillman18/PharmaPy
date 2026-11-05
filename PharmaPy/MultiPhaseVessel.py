@@ -1810,7 +1810,12 @@ class MultiPhaseVessel():
         if len(refs) < 2:
             return None
 
-        total_flow = float(trajectory['vol_flow'])
+        # A slurry fed live from another member of a ConcurrentVessel
+        # carries that member's traced state; the numeric path is unchanged.
+        traced = np.is_traced(trajectory)
+
+        total_flow = (trajectory['vol_flow'] if traced
+                      else float(trajectory['vol_flow']))
         shares = {}
         solid_fraction = 0.0
 
@@ -1835,13 +1840,16 @@ class MultiPhaseVessel():
 
                 # The mechanism knows how to read its own population: an
                 # integral over a resolved distribution, or mu_3 directly.
-                fraction = mechanism.solid_volume_fraction(
-                    np.asarray(trajectory[name], dtype=float))
+                population = (trajectory[name] if traced
+                              else np.asarray(trajectory[name], dtype=float))
+                fraction = mechanism.solid_volume_fraction(population)
 
-            shares[ref] = max(fraction, 0.0)
+            shares[ref] = (np.maximum(fraction, 0.0) if traced
+                           else max(fraction, 0.0))
             solid_fraction += shares[ref]
 
-        solid_fraction = min(solid_fraction, 1.0)
+        solid_fraction = (np.minimum(solid_fraction, 1.0) if traced
+                          else min(solid_fraction, 1.0))
 
         remaining = [ref for ref in refs if ref not in shares]
 

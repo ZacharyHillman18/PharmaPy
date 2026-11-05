@@ -460,6 +460,31 @@ def test_recycle_as_algebraic_tears_on_casadi_idas(jax):
     assert _max_rel(_pair_final(cv), _pair_final(expected)) < 1e-5
 
 
+def test_a_crystallizer_train_traces_through_its_slurry_link(jax):
+    """A continuous crystallizer feeding another sends a slurry: liquid and
+    crystals. Splitting that stream's flow between its phases used float()
+    and the builtin max/min, which a trace cannot take, so no crystallizer
+    train compiled. The compiled right-hand side now equals the train's own,
+    with crystals in the stream (a nonzero solid share)."""
+    from PharmaPy.ConcurrentVessel import ConcurrentVessel, StreamLink
+    from PharmaPy.TracedBackends import TracedModel
+
+    cv = ConcurrentVessel({'CR01': _crystallizer("continuous"),
+                           'CR02': _crystallizer("continuous")},
+                          [StreamLink('CR01', 'CR02')])
+    time, states = _start(cv)
+
+    rng = np.random.default_rng(2)
+    elsewhere = (states * (1 + 1e-2 * rng.standard_normal(states.size))
+                 + 1e3 * (states == 0))
+
+    model = TracedModel(cv, time, states)
+
+    for when, at in ((time, states), (time + 900.0, elsewhere)):
+        assert _max_rel(model.rhs(when, at),
+                        _numeric_rhs(cv, when, at)) < 1e-12, when
+
+
 def test_iterated_tears_are_refused_under_a_trace(jax):
     """Tear iteration stops when the values say so, which a trace cannot."""
     from PharmaPy.ConcurrentVessel import ConcurrentVessel, StreamLink
